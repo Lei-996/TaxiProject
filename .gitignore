@@ -1,0 +1,51 @@
+# Python 缓存与编译文件
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# 虚拟环境（你之前的 DStaxi_env）
+venv/
+env/
+.env/
+.venv/
+DStaxi_env/
+
+# VSCode 配置
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+
+# 日志文件
+*.log
+logs/
+
+# 所有 .pkl 缓存文件（关键！解决你遇到的大文件问题）
+*.pkl
+*.pickle
+
+# 数据目录（如果 data 里有大量原始数据，也建议忽略）
+data/
