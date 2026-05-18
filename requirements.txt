@@ -1,0 +1,10 @@
+# Web
+flask>=2.3.0,<4.0.0
+flask-cors>=4.0.0
+
+# Data processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Map visualization
+pydeck>=0.8.0

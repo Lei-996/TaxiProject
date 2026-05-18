@@ -1,0 +1,810 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="UTF-8">
+    <title>出租车轨迹分析系统</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        html, body {
+            height: 100%;
+            overflow: hidden;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #0d1117;
+        }
+
+        .container {
+            display: flex;
+            height: 100vh;
+        }
+
+        .sidebar {
+            width: 500px;
+            background: #161b22;
+            color: #c9d1d9;
+            padding: 20px;
+            overflow-y: auto;
+            border-right: 1px solid #30363d;
+        }
+
+        .sidebar h2 {
+            font-size: 18px;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid #30363d;
+            color: #58a6ff;
+        }
+
+        .sidebar h3 {
+            font-size: 14px;
+            margin: 15px 0 10px 0;
+            color: #58a6ff;
+        }
+
+        .sidebar h4 {
+            font-size: 12px;
+            margin: 10px 0 8px 0;
+            color: #8b949e;
+        }
+
+        .form-group {
+            margin-bottom: 15px;
+        }
+
+        label {
+            display: block;
+            font-size: 12px;
+            margin-bottom: 5px;
+            color: #8b949e;
+        }
+
+        input,
+        select {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            background: #0d1117;
+            color: #c9d1d9;
+            font-size: 12px;
+        }
+
+        .coord-group {
+            display: flex;
+            gap: 8px;
+        }
+
+        .coord-group input {
+            width: 25%;
+        }
+
+        .coord-group-half {
+            display: flex;
+            gap: 8px;
+        }
+
+        .coord-group-half input {
+            width: 33%;
+        }
+
+        button {
+            width: 100%;
+            padding: 10px;
+            margin-top: 5px;
+            background: #238636;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: bold;
+        }
+
+        button:hover {
+            background: #2ea043;
+        }
+
+        .btn-density {
+            background: #1f6feb;
+        }
+
+        .btn-density:hover {
+            background: #388bfd;
+        }
+
+        .btn-path {
+            background: #9e3b3b;
+        }
+
+        .btn-path:hover {
+            background: #c24444;
+        }
+
+        .btn-compare {
+            background: #6e5494;
+        }
+
+        .btn-compare:hover {
+            background: #8c6bb0;
+        }
+
+        .btn-od {
+            background: #1f6feb;
+        }
+
+        .btn-od:hover {
+            background: #388bfd;
+        }
+
+        .btn-freq {
+            background: #6e5494;
+        }
+
+        .btn-freq:hover {
+            background: #8c6bb0;
+        }
+
+        .btn-traj {
+            background: #238636;
+        }
+
+        .btn-traj:hover {
+            background: #2ea043;
+        }
+
+        .btn-reset {
+            background: #30363d;
+        }
+
+        .btn-reset:hover {
+            background: #484f58;
+        }
+
+        .result-area {
+            margin-top: 20px;
+            padding: 15px;
+            background: #0d1117;
+            border-radius: 6px;
+            font-size: 12px;
+            border: 1px solid #30363d;
+            max-height: 350px;
+            overflow-y: auto;
+        }
+
+        .info {
+            margin-top: 15px;
+            padding: 10px;
+            background: #0d1117;
+            border-radius: 6px;
+            font-size: 11px;
+            color: #8b949e;
+            border: 1px solid #30363d;
+        }
+
+        .map-container {
+            flex: 1;
+            min-width: 0;
+            min-height: 0;
+            position: relative;
+            overflow: hidden;
+        }
+
+        #map {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            width: 100%;
+            height: 100%;
+        }
+
+        .f2-status {
+            font-size: 11px;
+            color: #8b949e;
+            margin-top: 6px;
+        }
+
+        .status-badge {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #3fb950;
+            margin-right: 8px;
+        }
+
+        .stat-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 5px;
+        }
+
+        .compare-result {
+            font-size: 11px;
+            margin-top: 8px;
+            padding: 8px;
+            background: #0d1117;
+            border-radius: 4px;
+            border-left: 3px solid #58a6ff;
+            word-break: break-all;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <div class="sidebar">
+            <h2>🚕 出租车轨迹分析系统</h2>
+            <div class="info">
+                <span class="status-badge"></span> 数据：T-Drive<br>
+                <div class="stat-row"><span>🚗 车辆数：</span><span>{{ vehicle_count }}</span></div>
+                <div class="stat-row"><span>📊 轨迹点：</span><span>{{ total_points }}</span></div>
+                <div class="stat-row"><span>🗺️ 路网节点：</span><span>{{ graph_nodes }}</span></div>
+                <div class="stat-row"><span>🔗 路网边：</span><span>{{ graph_edges }}</span></div>
+                <div class="stat-row"><span>📈 学习样本：</span><span>{{ graph_samples }}</span></div>
+                <div class="stat-row"><span>🛤️ 路径总数：</span><span>{{ path_total }}</span></div>
+            </div>
+
+            <h3>🛤️ 轨迹可视化 (F1)</h3>
+            <div class="form-group">
+                <label>显示模式</label>
+                <select id="f1_mode" onchange="toggleF1VehicleInput()">
+                    <option value="single">指定车辆</option>
+                    <option value="all">全部出租车（采样多车）</option>
+                </select>
+            </div>
+            <div class="form-group" id="f1_vehicle_group">
+                <label>车辆 ID</label>
+                <input type="number" id="f1_vehicle_id" placeholder="车辆 ID" value="{{ sample_vehicle_id }}">
+            </div>
+            <div class="form-group" id="f1_all_group" style="display: none;">
+                <label>最多显示车辆数</label>
+                <input type="number" id="f1_max_vehicles" placeholder="最多 30 辆" value="15" min="1" max="30">
+            </div>
+            <div class="form-group">
+                <label>轨迹点采样（每 N 个点取 1 个）</label>
+                <input type="number" id="f1_point_sample" placeholder="采样间隔" value="5" min="1">
+            </div>
+            <button onclick="showTrajectory()" class="btn-traj">🛤️ 显示轨迹</button>
+            <button onclick="resetScatterViewport()" class="btn-reset" style="margin-top: 5px;">↩️ 恢复散点视图</button>
+
+            <h3>🔎 地图缩放 (F2)</h3>
+            <div class="form-group">
+                <label>
+                    <input type="checkbox" id="f2_dynamic_lod" checked>
+                    随缩放动态加载视野内轨迹点
+                </label>
+                <div class="f2-status" id="f2_status">zoom — | 点数 —</div>
+            </div>
+
+            <h3>🔍 区域搜索 (F3)</h3>
+            <div class="form-group">
+                <div class="coord-group">
+                    <input type="text" id="x_min" placeholder="最小经度" value="116.45">
+                    <input type="text" id="y_min" placeholder="最小纬度" value="39.85">
+                    <input type="text" id="x_max" placeholder="最大经度" value="116.55">
+                    <input type="text" id="y_max" placeholder="最大纬度" value="39.95">
+                </div>
+            </div>
+            <button onclick="regionSearch()">🔎 搜索区域内点</button>
+
+            <h3>🔥 密度分析 (F4)</h3>
+            <div class="form-group">
+                <label>分析时段</label>
+                <select id="density_period">
+                    <option value="all">全天</option>
+                    <option value="0">早高峰 (7:00-9:00)</option>
+                    <option value="1">晚高峰 (17:00-19:00)</option>
+                    <option value="2">平峰</option>
+                </select>
+            </div>
+            <button onclick="updateDensity()" class="btn-density">📊 更新密度分析</button>
+            <button onclick="showDensityStats()" class="btn-compare" style="margin-top: 5px;">📈 密度统计对比</button>
+
+            <h3>📊 区域关联分析 (F5/F6)</h3>
+            <h4>F5: 两区域间流量</h4>
+            <div class="form-group">
+                <label>区域 A</label>
+                <div class="coord-group">
+                    <input type="text" id="a_x_min" placeholder="最小经度" value="116.45">
+                    <input type="text" id="a_y_min" placeholder="最小纬度" value="39.85">
+                    <input type="text" id="a_x_max" placeholder="最大经度" value="116.55">
+                    <input type="text" id="a_y_max" placeholder="最大纬度" value="39.95">
+                </div>
+                <label style="margin-top: 8px;">区域 B</label>
+                <div class="coord-group">
+                    <input type="text" id="b_x_min" placeholder="最小经度" value="116.55">
+                    <input type="text" id="b_y_min" placeholder="最小纬度" value="39.85">
+                    <input type="text" id="b_x_max" placeholder="最大经度" value="116.65">
+                    <input type="text" id="b_y_max" placeholder="最大纬度" value="39.95">
+                </div>
+                <label style="margin-top: 8px;">分析时段</label>
+                <select id="od_period">
+                    <option value="all">全天</option>
+                    <option value="morning">早高峰 (7:00-9:00)</option>
+                    <option value="evening">晚高峰 (17:00-19:00)</option>
+                    <option value="offpeak">平峰</option>
+                </select>
+            </div>
+            <button onclick="odFlowAnalysis()" class="btn-od">📊 分析两区域流量</button>
+
+            <h4 style="margin-top: 12px;">F6: 单区域流量</h4>
+            <div class="form-group">
+                <label>目标区域</label>
+                <div class="coord-group">
+                    <input type="text" id="r_x_min" placeholder="最小经度" value="116.45">
+                    <input type="text" id="r_y_min" placeholder="最小纬度" value="39.85">
+                    <input type="text" id="r_x_max" placeholder="最大经度" value="116.55">
+                    <input type="text" id="r_y_max" placeholder="最大纬度" value="39.95">
+                </div>
+                <label style="margin-top: 8px;">分析时段</label>
+                <select id="od_region_period">
+                    <option value="all">全天</option>
+                    <option value="morning">早高峰 (7:00-9:00)</option>
+                    <option value="evening">晚高峰 (17:00-19:00)</option>
+                    <option value="offpeak">平峰</option>
+                </select>
+            </div>
+            <button onclick="odRegionFlowAnalysis()" class="btn-od">📈 分析区域流量</button>
+
+            <h3>🛤️ 频繁路径分析 (F7/F8)</h3>
+            <h4>F7: 全局频繁路径</h4>
+            <div class="form-group">
+                <div class="coord-group-half">
+                    <input type="number" id="f7_k" placeholder="Top-K" value="10">
+                    <input type="number" id="f7_min_distance" placeholder="最小距离(米)" value="0">
+                </div>
+            </div>
+            <button onclick="frequentPathsGlobal()" class="btn-freq">🛤️ 全局频繁路径</button>
+
+            <h4 style="margin-top: 12px;">F8: 区域间频繁路径</h4>
+            <div class="form-group">
+                <label>起点区域</label>
+                <div class="coord-group">
+                    <input type="text" id="f8_start_x_min" placeholder="最小经度" value="116.45">
+                    <input type="text" id="f8_start_y_min" placeholder="最小纬度" value="39.85">
+                    <input type="text" id="f8_start_x_max" placeholder="最大经度" value="116.55">
+                    <input type="text" id="f8_start_y_max" placeholder="最大纬度" value="39.95">
+                </div>
+                <label style="margin-top: 8px;">终点区域</label>
+                <div class="coord-group">
+                    <input type="text" id="f8_end_x_min" placeholder="最小经度" value="116.55">
+                    <input type="text" id="f8_end_y_min" placeholder="最小纬度" value="39.85">
+                    <input type="text" id="f8_end_x_max" placeholder="最大经度" value="116.65">
+                    <input type="text" id="f8_end_y_max" placeholder="最大纬度" value="39.95">
+                </div>
+                <div class="coord-group-half" style="margin-top: 8px;">
+                    <input type="number" id="f8_k" placeholder="Top-K" value="10">
+                    <input type="number" id="f8_min_distance" placeholder="最小距离(米)" value="0">
+                </div>
+            </div>
+            <button onclick="frequentPathsBetween()" class="btn-freq">🛤️ 区域间频繁路径</button>
+
+            <h3>🛣️ 最短时间路径 (F9)</h3>
+            <div class="form-group">
+                <div class="coord-group">
+                    <input type="text" id="start_lon" placeholder="起点经度" value="116.45">
+                    <input type="text" id="start_lat" placeholder="起点纬度" value="39.85">
+                    <input type="text" id="end_lon" placeholder="终点经度" value="116.55">
+                    <input type="text" id="end_lat" placeholder="终点纬度" value="39.95">
+                </div>
+                <label style="margin-top: 8px;">出行时段</label>
+                <select id="time_period">
+                    <option value="0">🚗 早高峰 (7:00-9:00)</option>
+                    <option value="1">🏠 晚高峰 (17:00-19:00)</option>
+                    <option value="2" selected>☀️ 平峰</option>
+                </select>
+            </div>
+            <button onclick="findShortestPath()" class="btn-path">🛣️ 计算最短时间路径</button>
+            <button onclick="comparePaths()" class="btn-compare" style="margin-top: 5px;">📊 对比各时段</button>
+
+            <div class="result-area" id="result">
+                <strong>📋 结果</strong><br>等待操作...
+            </div>
+            <div class="info">
+                💡 功能说明：<br>
+                • <strong>轨迹可视化 (F1)</strong>：指定车辆或采样多车，PathLayer 绘制 GPS 折线轨迹<br>
+                • <strong>地图缩放 (F2)</strong>：滚轮缩放时按视野与 zoom 自动调整点密度（四叉树 LOD）<br>
+                • <strong>区域搜索 (F3)</strong>：四叉树快速查询矩形区域内轨迹点<br>
+                • <strong>密度分析 (F4)</strong>：100×100网格，支持早/晚/平峰/全天<br>
+                • <strong>OD分析 (F5/F6)</strong>：每条网格 OD 一条拱线（最多300条，绿=出发/A→B）<br>
+                • <strong>频繁路径 (F7/F8)</strong>：前缀树挖掘 Top-K 频繁路径（按距离过滤）<br>
+                • <strong>最短路径 (F9)</strong>：时间依赖 Dijkstra，从真实轨迹学习通行时间
+            </div>
+        </div>
+
+        <div class="map-container">
+            <div id="map"></div>
+        </div>
+    </div>
+
+    <script>
+        window.INITIAL_MAP = {{ initial_map | tojson }};
+    </script>
+    <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" />
+    <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+    <script src="https://unpkg.com/deck.gl@8.9.36/dist.min.js"></script>
+    <script src="{{ url_for('static', filename='js/map_view.js') }}"></script>
+    <script>
+        function toggleF1VehicleInput() {
+            const mode = document.getElementById('f1_mode').value;
+            document.getElementById('f1_vehicle_group').style.display = mode === 'single' ? 'block' : 'none';
+            document.getElementById('f1_all_group').style.display = mode === 'all' ? 'block' : 'none';
+        }
+
+        // F1: 轨迹可视化
+        async function showTrajectory() {
+            const mode = document.getElementById('f1_mode').value;
+            const vehicle_id = parseInt(document.getElementById('f1_vehicle_id').value);
+            const max_vehicles = parseInt(document.getElementById('f1_max_vehicles').value) || 15;
+            const point_sample = parseInt(document.getElementById('f1_point_sample').value) || 5;
+
+            if (mode === 'single' && isNaN(vehicle_id)) {
+                updateResult("❌ 请输入有效的车辆 ID", "error");
+                return;
+            }
+
+            updateResult("⏳ 加载轨迹...", "info");
+            try {
+                const body = { mode, point_sample, max_vehicles };
+                if (mode === 'single') body.vehicle_id = vehicle_id;
+
+                const resp = await fetch('/api/trajectory', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body)
+                });
+                const data = await resp.json();
+                if (data.error) {
+                    updateResult(`❌ ${data.error}`, "error");
+                } else {
+                    const ids = data.vehicle_ids.slice(0, 5).join(', ');
+                    const more = data.vehicle_count > 5 ? ` 等 ${data.vehicle_count} 辆` : '';
+                    updateResult(
+                        `✅ 已显示 ${data.vehicle_count} 条轨迹，共 ${data.point_count.toLocaleString()} 个点 (${data.query_time.toFixed(2)}秒)<br>ID: ${ids}${more}`,
+                        "success"
+                    );
+                    applyMapFromApi(data);
+                }
+            } catch (e) {
+                updateResult("❌ 加载轨迹失败: " + e.message, "error");
+            }
+        }
+
+        // 区域搜索
+        async function regionSearch() {
+            const rect = {
+                x_min: parseFloat(document.getElementById('x_min').value),
+                y_min: parseFloat(document.getElementById('y_min').value),
+                x_max: parseFloat(document.getElementById('x_max').value),
+                y_max: parseFloat(document.getElementById('y_max').value)
+            };
+            updateResult("⏳ 搜索中...", "info");
+            try {
+                const resp = await fetch('/api/search', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ rect })
+                });
+                const data = await resp.json();
+                updateResult(`✅ 找到 ${data.count} 个点 (${data.query_time.toFixed(2)}秒)`, "success");
+                applyMapFromApi(data);
+            } catch (e) {
+                updateResult("❌ 搜索失败", "error");
+            }
+        }
+
+        // 密度分析
+        async function updateDensity() {
+            const period = document.getElementById('density_period').value;
+            updateResult("⏳ 计算密度分析...", "info");
+            try {
+                const resp = await fetch('/api/density_by_period', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ period: period === 'all' ? null : parseInt(period) })
+                });
+                const data = await resp.json();
+                updateResult(`✅ ${data.period_name}密度完成 | 点数: ${data.total_points.toLocaleString()}`, "success");
+                applyMapFromApi(data);
+            } catch (e) {
+                updateResult("❌ 密度计算失败", "error");
+            }
+        }
+
+        async function showDensityStats() {
+            updateResult("⏳ 获取密度统计...", "info");
+            try {
+                const resp = await fetch('/api/density_stats');
+                const data = await resp.json();
+                let html = `<strong>📊 密度统计对比 (100×100网格)</strong><br>`;
+                for (const stat of data) {
+                    html += `<div class="compare-result">${stat.name}: ${stat.total_points.toLocaleString()} 点</div>`;
+                }
+                document.getElementById('result').innerHTML = html;
+            } catch (e) {
+                updateResult("❌ 获取统计失败", "error");
+            }
+        }
+
+        // F5: 两区域间流量
+        async function odFlowAnalysis() {
+            const rect1 = {
+                x_min: parseFloat(document.getElementById('a_x_min').value),
+                y_min: parseFloat(document.getElementById('a_y_min').value),
+                x_max: parseFloat(document.getElementById('a_x_max').value),
+                y_max: parseFloat(document.getElementById('a_y_max').value)
+            };
+            const rect2 = {
+                x_min: parseFloat(document.getElementById('b_x_min').value),
+                y_min: parseFloat(document.getElementById('b_y_min').value),
+                x_max: parseFloat(document.getElementById('b_x_max').value),
+                y_max: parseFloat(document.getElementById('b_y_max').value)
+            };
+            const period = document.getElementById('od_period').value;
+
+            updateResult("⏳ 分析区域流量...", "info");
+            try {
+                const resp = await fetch('/api/od_flow', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ rect1, rect2, period })
+                });
+                const data = await resp.json();
+                if (data.error) {
+                    updateResult(`❌ ${data.error}`, "error");
+                } else {
+                    let arcInfo = `已绘制 ${data.arcs_drawn || 0} 条路径弧线`;
+                    if (data.path_count > data.arcs_drawn) {
+                        arcInfo += `（共 ${data.path_count} 条，显示流量最高的 ${data.arcs_drawn} 条）`;
+                    }
+                    if (period === 'all') {
+                        let html = `<strong>📊 两区域流量对比（分时段）</strong><br>`;
+                        html += `<span style="color:#8b949e;font-size:11px;">${arcInfo}，每条网格 OD 各一条拱线</span><br>`;
+                        for (const [p, f] of Object.entries(data.flows)) {
+                            html += `<div class="compare-result">
+                                        <strong>${p}</strong><br>
+                                        A→B: ${f.from_rect1_to_rect2} | B→A: ${f.from_rect2_to_rect1} | 总计: ${f.total}
+                                    </div>`;
+                        }
+                        document.getElementById('result').innerHTML = html;
+                    } else {
+                        const f = data.flows;
+                        updateResult(
+                            `✅ ${period}: A→B: ${f.from_rect1_to_rect2} | B→A: ${f.from_rect2_to_rect1} | 总计: ${f.total}<br>${arcInfo}`,
+                            "success"
+                        );
+                    }
+
+                    if (data.map) applyMapFromApi(data);
+                }
+            } catch (e) {
+                updateResult("❌ 分析失败", "error");
+            }
+        }
+
+        // F6: 单区域流量
+        async function odRegionFlowAnalysis() {
+            const rect = {
+                x_min: parseFloat(document.getElementById('r_x_min').value),
+                y_min: parseFloat(document.getElementById('r_y_min').value),
+                x_max: parseFloat(document.getElementById('r_x_max').value),
+                y_max: parseFloat(document.getElementById('r_y_max').value)
+            };
+            const period = document.getElementById('od_region_period').value;
+
+            updateResult("⏳ 分析区域流量...", "info");
+            try {
+                const resp = await fetch('/api/od_region_flow', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ rect, period })
+                });
+                const data = await resp.json();
+                if (data.error) {
+                    updateResult(`❌ ${data.error}`, "error");
+                } else {
+                    let arcInfo = `已绘制 ${data.arcs_drawn || 0} 条路径弧线`;
+                    if (data.path_count > data.arcs_drawn) {
+                        arcInfo += `（共 ${data.path_count} 条，显示流量最高的 ${data.arcs_drawn} 条）`;
+                    }
+                    if (period === 'all') {
+                        let html = `<strong>📊 区域流量分析（分时段）</strong><br>`;
+                        html += `<span style="color:#8b949e;font-size:11px;">${arcInfo}，绿=出发 蓝=到达</span><br>`;
+                        for (const [p, f] of Object.entries(data.flows)) {
+                            html += `<div class="compare-result">
+                                        <strong>${p}</strong><br>
+                                        出发: ${f.total_departures} | 到达: ${f.total_arrivals}
+                                        <br><strong>Top目的地:</strong> ${f.top_destinations.slice(0, 3).map(d => `${d.grid_id}:${d.flow}`).join(', ')}
+                                    </div>`;
+                        }
+                        document.getElementById('result').innerHTML = html;
+                    } else {
+                        const f = data.flows;
+                        let html = `<strong>📊 区域流量分析 (${period})</strong><br>
+                                    <span style="color:#8b949e;font-size:11px;">${arcInfo}</span><br>
+                                    出发总数: ${f.total_departures} 次<br>
+                                    到达总数: ${f.total_arrivals} 次<br><br>
+                                    <strong>主要目的地 (Top 5):</strong><br>`;
+                        for (const dest of f.top_destinations.slice(0, 5)) {
+                            html += `└ 区域 ${dest.grid_id}: ${dest.flow} 次<br>`;
+                        }
+                        html += `<br><strong>主要来源地 (Top 5):</strong><br>`;
+                        for (const src of f.top_sources.slice(0, 5)) {
+                            html += `└ 区域 ${src.grid_id}: ${src.flow} 次<br>`;
+                        }
+                        document.getElementById('result').innerHTML = html;
+                    }
+
+                    if (data.map) applyMapFromApi(data);
+                }
+            } catch (e) {
+                updateResult("❌ 分析失败", "error");
+            }
+        }
+
+        // F7: 全局频繁路径
+        async function frequentPathsGlobal() {
+            const k = parseInt(document.getElementById('f7_k').value) || 10;
+            const min_distance = parseInt(document.getElementById('f7_min_distance').value) || 0;
+
+            updateResult("⏳ 分析全局频繁路径...", "info");
+
+            try {
+                const resp = await fetch('/api/frequent_paths_global', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ k: k, min_distance: min_distance })
+                });
+                const data = await resp.json();
+
+                if (data.error) {
+                    updateResult(`❌ ${data.error}`, "error");
+                } else {
+                    let html = `<strong>📊 全局 Top-${data.k} 频繁路径 (距离≥${data.min_distance}m)</strong><br>`;
+                    if (data.top_paths.length === 0) {
+                        html += `<div class="compare-result">未找到符合条件的路径</div>`;
+                    } else {
+                        for (let i = 0; i < data.top_paths.length; i++) {
+                            const p = data.top_paths[i];
+                            const path_str = p.grid_ids.join(' → ');
+                            html += `<div class="compare-result">
+                                        <strong>#${i + 1}</strong> 频率: ${p.count} 次 | 距离: ${p.distance.toLocaleString()}m<br>
+                                        路径: ${path_str.length > 60 ? path_str.substring(0, 60) + '...' : path_str}
+                                     </div>`;
+                        }
+                    }
+                    document.getElementById('result').innerHTML = html;
+
+                    if (data.map) applyMapFromApi(data);
+                }
+            } catch (e) {
+                updateResult("❌ 分析失败: " + e.message, "error");
+            }
+        }
+
+        // F8: 区域间频繁路径
+        async function frequentPathsBetween() {
+            const start_rect = {
+                x_min: parseFloat(document.getElementById('f8_start_x_min').value),
+                y_min: parseFloat(document.getElementById('f8_start_y_min').value),
+                x_max: parseFloat(document.getElementById('f8_start_x_max').value),
+                y_max: parseFloat(document.getElementById('f8_start_y_max').value)
+            };
+            const end_rect = {
+                x_min: parseFloat(document.getElementById('f8_end_x_min').value),
+                y_min: parseFloat(document.getElementById('f8_end_y_min').value),
+                x_max: parseFloat(document.getElementById('f8_end_x_max').value),
+                y_max: parseFloat(document.getElementById('f8_end_y_max').value)
+            };
+            const k = parseInt(document.getElementById('f8_k').value) || 10;
+            const min_distance = parseInt(document.getElementById('f8_min_distance').value) || 0;
+
+            updateResult("⏳ 分析区域间频繁路径...", "info");
+
+            try {
+                const resp = await fetch('/api/frequent_paths_between', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ rect1: start_rect, rect2: end_rect, k: k, min_distance: min_distance })
+                });
+                const data = await resp.json();
+
+                if (data.error) {
+                    updateResult(`❌ ${data.error}`, "error");
+                } else {
+                    let html = `<strong>📊 区域间 Top-${data.k} 频繁路径 (距离≥${data.min_distance}m)</strong><br>`;
+                    if (data.top_paths.length === 0) {
+                        html += `<div class="compare-result">未找到符合条件的路径</div>`;
+                    } else {
+                        for (let i = 0; i < data.top_paths.length; i++) {
+                            const p = data.top_paths[i];
+                            const path_str = p.grid_ids.join(' → ');
+                            html += `<div class="compare-result">
+                                        <strong>#${i + 1}</strong> 频率: ${p.count} 次 | 距离: ${p.distance.toLocaleString()}m<br>
+                                        路径: ${path_str.length > 60 ? path_str.substring(0, 60) + '...' : path_str}
+                                     </div>`;
+                        }
+                    }
+                    document.getElementById('result').innerHTML = html;
+
+                    if (data.map) applyMapFromApi(data);
+                }
+            } catch (e) {
+                updateResult("❌ 分析失败: " + e.message, "error");
+            }
+        }
+
+        // F9: 最短路径
+        async function findShortestPath() {
+            const start_lon = parseFloat(document.getElementById('start_lon').value);
+            const start_lat = parseFloat(document.getElementById('start_lat').value);
+            const end_lon = parseFloat(document.getElementById('end_lon').value);
+            const end_lat = parseFloat(document.getElementById('end_lat').value);
+            const period = parseInt(document.getElementById('time_period').value);
+
+            if (isNaN(start_lon) || isNaN(start_lat) || isNaN(end_lon) || isNaN(end_lat)) {
+                updateResult("❌ 请输入完整坐标", "error");
+                return;
+            }
+            updateResult("⏳ Dijkstra 计算中...", "info");
+            try {
+                const resp = await fetch('/api/shortest_path', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ start_lon, start_lat, end_lon, end_lat, period })
+                });
+                const data = await resp.json();
+                if (data.error) {
+                    updateResult(`❌ ${data.error}`, "error");
+                } else {
+                    updateResult(`✅ 预估时间: ${data.time_str} (${data.period})`, "success");
+                    applyMapFromApi(data);
+                }
+            } catch (e) {
+                updateResult("❌ 计算失败", "error");
+            }
+        }
+
+        async function comparePaths() {
+            const start_lon = parseFloat(document.getElementById('start_lon').value);
+            const start_lat = parseFloat(document.getElementById('start_lat').value);
+            const end_lon = parseFloat(document.getElementById('end_lon').value);
+            const end_lat = parseFloat(document.getElementById('end_lat').value);
+
+            updateResult("⏳ 对比各时段...", "info");
+            try {
+                const resp = await fetch('/api/compare_paths', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ start_lon, start_lat, end_lon, end_lat })
+                });
+                const data = await resp.json();
+                let html = `<strong>📊 时段对比（从真实数据学习）</strong><br>`;
+                for (const [period, info] of Object.entries(data)) {
+                    html += `<div class="compare-result">${period}: ${info.time_str}</div>`;
+                }
+                document.getElementById('result').innerHTML = html;
+            } catch (e) {
+                updateResult("❌ 对比失败", "error");
+            }
+        }
+
+        function updateResult(msg, type) {
+            const div = document.getElementById('result');
+            const colors = { error: '#f85149', success: '#3fb950', info: '#d29922' };
+            div.innerHTML = `<strong>📋 结果</strong><br><span style="color: ${colors[type] || '#8b949e'}">${msg}</span>`;
+        }
+    </script>
+</body>
+
+</html>
