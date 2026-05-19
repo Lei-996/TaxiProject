@@ -18,7 +18,12 @@ from grid_utils import (
     lonlat_to_grid_id, rect_to_grid_ids, grid_id_to_bounds,
     TimePeriod, GRID_SIZE
 )
-from path_trie import build_path_trie, get_path_distance
+from path_trie import (
+    build_path_trie,
+    get_path_distance,
+    trip_to_display_coords,
+    trajectory_to_path_sequence,
+)
 from map_view import (
     DEFAULT_VIEW_STATE, build_payload, scatter_layer, path_layer,
     column_layer, polygon_layer, arc_layer, thin_quadtree_points, bbox_from_view,
@@ -49,7 +54,8 @@ OD_MATRIX_FILE = "od_matrix_by_period.pkl"
 OD_SAMPLE_RATE = 1.0
 
 # 路径分析配置
-PATH_TRIE_FILE = "path_trie_cache.pkl"
+PATH_TRIE_FILE = os.path.join(_BASE_DIR, "path_trie_cache.pkl")
+PATH_EXEMPLAR_FILE = os.path.join(_BASE_DIR, "path_exemplars_cache.pkl")
 PATH_SAMPLE_RATE = 1.0
 
 # F1 轨迹可视化
@@ -702,35 +708,249 @@ def get_region_flows_by_period(rect, period=None):
 
 # ========== 路径前缀树初始化 ==========
 print("\n🚗 构建路径前缀树...")
-path_trie = build_path_trie(
+path_trie, path_exemplars = build_path_trie(
     data_loader,
     vehicle_list,
     split_trips,
     cache_file=PATH_TRIE_FILE,
+    exemplar_cache_file=PATH_EXEMPLAR_FILE,
     sample_rate=PATH_SAMPLE_RATE,
-    force_recompute=False
+    force_recompute=False,
 )
+print(f"   GPS 样例索引: {len(path_exemplars):,} 条")
+print(f"   样例缓存: {PATH_EXEMPLAR_FILE}")
+if len(path_exemplars) == 0:
+    print("   ⚠️ GPS 样例为空：F7/F8 地图将显示网格直线，直至补建完成")
+elif not os.path.isfile(PATH_EXEMPLAR_FILE):
+    print("   ⚠️ 样例缓存文件未落盘，下次查询命中后会尝试保存")
 
 
-def _filter_paths_by_distance(path_counts, min_distance, k):
-    """从 Trie 候选路径中按距离过滤并取 Top-K"""
-    result_paths = []
-    for path, count in path_counts:
-        coords = []
-        for grid_id in path:
-            bounds = grid_id_to_bounds(grid_id)
-            if bounds:
-                coords.append([(bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2])
-        distance = get_path_distance(coords) if len(coords) >= 2 else 0
-        if distance >= min_distance:
-            result_paths.append({
-                'grid_ids': path,
-                'count': count,
-                'coords': coords,
-                'distance': round(distance),
-            })
-    result_paths.sort(key=lambda x: x['count'], reverse=True)
-    return result_paths[:k]
+def _grid_path_coords(path):
+    """统计用：网格中心折线"""
+    coords = []
+    for grid_id in path:
+        bounds = grid_id_to_bounds(grid_id)
+        if bounds:
+            coords.append([(bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2])
+    return coords
+
+
+def _backtrack_gps_for_path(path_seq):
+    """样例未命中时，扫描轨迹找 grid 序列完全一致的 trip"""
+    target = tuple(int(g) for g in path_seq)
+    for vid in vehicle_list:
+        df = data_loader.load_vehicle_trajectory(vid)
+        if df is None or len(df) < 5:
+            continue
+        for trip in split_trips(df):
+            if len(trip) < 3:
+                continue
+            seq = trajectory_to_path_sequence(trip, min_grids=2)
+            if tuple(int(g) for g in seq) == target:
+                coords = trip_to_display_coords(trip)
+                if len(coords) >= 2:
+                    return coords, trip
+    return None, None
+
+
+def _resolve_display_coords(path, grid_coords, exemplar_store, allow_backtrack=True):
+    """展示坐标：优先样例索引，可选单次回溯匹配 trip"""
+    if exemplar_store is not None:
+        coords, ok = exemplar_store.get_display_coords(path, grid_coords)
+        if ok and len(coords) >= 2:
+            return coords, True, False
+    if not allow_backtrack:
+        return grid_coords, False, False
+    gps_coords, trip = _backtrack_gps_for_path(path)
+    if gps_coords:
+        dirty = False
+        if exemplar_store is not None and trip is not None:
+            key = tuple(int(g) for g in path)
+            prev = exemplar_store.exemplars.get(key)
+            exemplar_store.register(path, trip)
+            dirty = prev is None or exemplar_store.exemplars.get(key) is not prev
+        return gps_coords, True, dirty
+    return grid_coords, False, False
+
+
+def _gps_display_hint(gps_hits, total):
+    if total <= 0:
+        return None
+    if gps_hits >= total:
+        return None
+    if gps_hits == 0:
+        return (
+            '未命中 GPS 样例，地图为网格中心直线。'
+            '请完整重启服务并等待控制台出现「GPS 样例索引完成」；'
+            f'或确认存在文件: {os.path.basename(PATH_EXEMPLAR_FILE)}'
+        )
+    return f'有 {total - gps_hits} 条路径无 GPS 样例，已用网格折线代替。'
+
+
+def _persist_exemplars_if_updated(exemplar_store, size_before, dirty=False):
+    if exemplar_store is not None and (len(exemplar_store) > size_before or dirty):
+        try:
+            exemplar_store.save(PATH_EXEMPLAR_FILE)
+        except OSError as e:
+            print(f"⚠️ GPS 样例缓存保存失败: {e}")
+
+
+def _select_frequent_paths_by_distance(path_iter, k, min_distance, min_length=2):
+    """先按地理距离过滤，再按频次取 Top-K（避免短线占满候选池）"""
+    qualified = []
+    for path, count in path_iter:
+        if len(path) < min_length:
+            continue
+        grid_coords = _grid_path_coords(path)
+        distance = get_path_distance(grid_coords) if len(grid_coords) >= 2 else 0
+        if distance < min_distance:
+            continue
+        qualified.append({
+            'grid_ids': path,
+            'count': count,
+            'distance': round(distance),
+            'grid_coords': grid_coords,
+        })
+    qualified.sort(key=lambda x: x['count'], reverse=True)
+    return qualified[:k]
+
+
+def _enrich_paths_with_gps_display(path_rows, exemplar_store=None):
+    """仅对最终路径解析 GPS 展示坐标"""
+    exemplar_before = len(exemplar_store) if exemplar_store is not None else 0
+    exemplar_dirty = False
+    gps_hits = 0
+    for item in path_rows:
+        display_coords, from_gps, dirty = _resolve_display_coords(
+            item['grid_ids'], item['grid_coords'], exemplar_store
+        )
+        item['display_coords'] = display_coords
+        item['display_from_gps'] = from_gps
+        if from_gps:
+            gps_hits += 1
+        exemplar_dirty = exemplar_dirty or dirty
+    _persist_exemplars_if_updated(exemplar_store, exemplar_before, exemplar_dirty)
+    return path_rows, gps_hits
+
+
+def _get_global_frequent_candidates(k, min_distance, min_length=2):
+    return _select_frequent_paths_by_distance(
+        path_trie.get_all_paths_with_counts(), k, min_distance, min_length
+    )
+
+
+def _get_region_frequent_candidates(start_grids, end_grids, k, min_distance, min_length=2):
+    def _iter_region_paths():
+        for path, count in path_trie.get_all_paths_with_counts():
+            if len(path) >= min_length and path[0] in start_grids and path[-1] in end_grids:
+                yield path, count
+
+    return _select_frequent_paths_by_distance(
+        _iter_region_paths(), k, min_distance, min_length
+    )
+
+
+def _rect_center(rect):
+    """矩形 dict 或 (x_min, y_min, x_max, y_max) 元组 -> 中心点"""
+    if isinstance(rect, dict):
+        x_min = float(rect['x_min'])
+        y_min = float(rect['y_min'])
+        x_max = float(rect['x_max'])
+        y_max = float(rect['y_max'])
+    else:
+        x_min, y_min, x_max, y_max = (float(v) for v in rect)
+    return (x_min + x_max) / 2, (y_min + y_max) / 2
+
+
+def _parse_f9_points(data):
+    """F9: 支持矩形区域中心或起终点坐标"""
+    rect1, rect2 = data.get('rect1'), data.get('rect2')
+    if rect1 and rect2:
+        slon, slat = _rect_center(rect1)
+        elon, elat = _rect_center(rect2)
+    else:
+        slon = float(data['start_lon']) if data.get('start_lon') is not None else None
+        slat = float(data['start_lat']) if data.get('start_lat') is not None else None
+        elon = float(data['end_lon']) if data.get('end_lon') is not None else None
+        elat = float(data['end_lat']) if data.get('end_lat') is not None else None
+    return slon, slat, elon, elat
+
+
+def _graph_path_to_grid_sequence(node_path):
+    seq = []
+    for node_id in node_path:
+        coords = graph.get_node_coords(node_id)
+        if not coords:
+            continue
+        gid = lonlat_to_grid_id(coords[0], coords[1])
+        if gid != -1 and (not seq or seq[-1] != gid):
+            seq.append(gid)
+    return seq
+
+
+def _graph_node_path_coords(node_path):
+    coords = []
+    for node_id in node_path:
+        pt = graph.get_node_coords(node_id)
+        if pt:
+            coords.append([float(pt[0]), float(pt[1])])
+    return coords
+
+
+def _resolve_graph_path_display(node_path, exemplar_store=None):
+    """F9: 路网节点折线 -> 优先匹配 GPS 样例轨迹"""
+    fallback = _graph_node_path_coords(node_path)
+    if len(fallback) < 2:
+        return fallback, False
+    seq = _graph_path_to_grid_sequence(node_path)
+    if len(seq) >= 2:
+        display_coords, from_gps, dirty = _resolve_display_coords(
+            seq, fallback, exemplar_store
+        )
+        if from_gps:
+            return display_coords, True
+    return fallback, False
+
+
+def _generate_shortest_path_map_payload(
+    path_coords, slon, slat, elon, elat, color=None, layer_id='shortest-path',
+):
+    layers = [
+        path_layer([{
+            'path': path_coords,
+            'color': color or [255, 100, 50, 255],
+            'width': 5,
+        }], layer_id),
+    ]
+    markers = [
+        {'lon': slon, 'lat': slat, 'type': '起点', 'color': [50, 200, 50, 255]},
+        {'lon': elon, 'lat': elat, 'type': '终点', 'color': [200, 50, 50, 255]},
+    ]
+    layers.append(scatter_layer(markers, layer_id='path-markers', radius=80))
+    vs = view_state_for_coords(
+        [p[0] for p in path_coords] + [slon, elon],
+        [p[1] for p in path_coords] + [slat, elat],
+    )
+    return build_payload(vs, layers, '{type}', lock_viewport=True)
+
+
+def _generate_compare_paths_map_payload(path_items, slon, slat, elon, elat):
+    """多条时段路径对比（不同颜色）"""
+    records = []
+    all_lons, all_lats = [slon, elon], [slat, elat]
+    for coords, color, _label in path_items:
+        if len(coords) < 2:
+            continue
+        all_lons.extend(p[0] for p in coords)
+        all_lats.extend(p[1] for p in coords)
+        records.append({'path': coords, 'color': color, 'width': 4})
+    layers = [path_layer(records, 'compare-paths')] if records else []
+    layers.append(scatter_layer([
+        {'lon': slon, 'lat': slat, 'type': '起点', 'color': [50, 200, 50, 255]},
+        {'lon': elon, 'lat': elat, 'type': '终点', 'color': [200, 50, 50, 255]},
+    ], layer_id='path-markers', radius=80))
+    vs = view_state_for_coords(all_lons, all_lats)
+    return build_payload(vs, layers, '{type}', lock_viewport=True)
 
 
 # ========== 地图 JSON 载荷 ==========
@@ -780,11 +1000,6 @@ def generate_paths_with_regions_map_payload(paths_data, rect1_bounds, rect2_boun
         [x_min1, x_max2], [y_min1, y_max2]
     )
     return build_payload(vs, layers, '车辆ID: {taxi_id}', lock_viewport=True)
-
-
-def _rect_center(rect_bounds):
-    x_min, y_min, x_max, y_max = rect_bounds
-    return (x_min + x_max) / 2, (y_min + y_max) / 2
 
 
 def _od_paths_to_arcs(od_paths, mode='f5'):
@@ -1118,31 +1333,33 @@ def normal_view():
 @app.route('/api/shortest_path', methods=['POST'])
 def shortest_path():
     start = time.time()
-    data = request.json
-    slon, slat = data.get('start_lon'), data.get('start_lat')
-    elon, elat = data.get('end_lon'), data.get('end_lat')
+    data = request.json or {}
+    slon, slat, elon, elat = _parse_f9_points(data)
     period = data.get('period', TimePeriod.OFF_PEAK)
 
     if None in [slon, slat, elon, elat]:
-        return jsonify({'error': '缺少坐标'}), 400
+        return jsonify({'error': '缺少起点/终点（坐标或矩形区域）'}), 400
 
     start_node, _ = graph.find_nearest_node(slon, slat)
     end_node, _ = graph.find_nearest_node(elon, elat)
 
     if start_node is None or end_node is None:
-        return jsonify({'error': '无法找到附近节点'}), 400
+        return jsonify({'error': '无法找到附近路网节点'}), 400
 
     path, total_time = graph.dijkstra_time(start_node, end_node, period)
 
     if path is None:
         return jsonify({'error': '未找到路径'}), 400
 
-    coords = graph.get_path_coords(path)
+    coords, from_gps = _resolve_graph_path_display(path, path_exemplars)
     elapsed = time.time() - start
     time_str = f"{total_time/60:.1f}分钟" if total_time > 60 else f"{total_time:.0f}秒"
     period_name = TimePeriod.get_period_name(period)
 
-    print(f"🛣️ 路径: {len(path)}节点, {time_str}, {period_name}, 耗时{elapsed:.3f}s")
+    print(
+        f"🛣️ 路径: {len(path)}节点, {time_str}, {period_name}, "
+        f"GPS展示={'是' if from_gps else '否'}, 耗时{elapsed:.3f}s"
+    )
 
     return jsonify({
         'success': True,
@@ -1150,32 +1367,62 @@ def shortest_path():
         'time_str': time_str,
         'period': period_name,
         'node_count': len(path),
+        'display_from_gps': from_gps,
         'query_time': elapsed,
-        'map': generate_map_payload(path_coords=coords,
-                                    start_lon=slon, start_lat=slat,
-                                    end_lon=elon, end_lat=elat)
+        'map': _generate_shortest_path_map_payload(
+            coords, slon, slat, elon, elat
+        ),
     })
 
 
 @app.route('/api/compare_paths', methods=['POST'])
 def compare_paths():
-    data = request.json
-    slon, slat = data.get('start_lon'), data.get('start_lat')
-    elon, elat = data.get('end_lon'), data.get('end_lat')
+    data = request.json or {}
+    slon, slat, elon, elat = _parse_f9_points(data)
+
+    if None in [slon, slat, elon, elat]:
+        return jsonify({'error': '缺少起点/终点（坐标或矩形区域）'}), 400
 
     start_node, _ = graph.find_nearest_node(slon, slat)
     end_node, _ = graph.find_nearest_node(elon, elat)
 
+    if start_node is None or end_node is None:
+        return jsonify({'error': '无法找到附近路网节点'}), 400
+
+    period_colors = [
+        [255, 120, 80, 220],
+        [100, 160, 255, 220],
+        [80, 210, 120, 220],
+    ]
     results = {}
-    for period in TimePeriod.get_all_periods():
-        if start_node and end_node:
-            _, t = graph.dijkstra_time(start_node, end_node, period)
-            if t:
-                results[TimePeriod.get_period_name(period)] = {
-                    'time_seconds': round(t),
-                    'time_str': f"{t/60:.1f}分钟" if t > 60 else f"{t:.0f}秒"
-                }
-    return jsonify(results)
+    path_items = []
+    gps_hits = 0
+
+    for i, period in enumerate(TimePeriod.get_all_periods()):
+        node_path, t = graph.dijkstra_time(start_node, end_node, period)
+        name = TimePeriod.get_period_name(period)
+        if node_path and t is not None:
+            coords, from_gps = _resolve_graph_path_display(node_path, path_exemplars)
+            if from_gps:
+                gps_hits += 1
+            results[name] = {
+                'time_seconds': round(t),
+                'time_str': f"{t/60:.1f}分钟" if t > 60 else f"{t:.0f}秒",
+                'node_count': len(node_path),
+                'display_from_gps': from_gps,
+            }
+            path_items.append((coords, period_colors[i % len(period_colors)], name))
+
+    payload = {
+        'periods': results,
+        'gps_display_count': gps_hits,
+        'exemplar_index_size': len(path_exemplars),
+    }
+    if path_items:
+        payload['map'] = _generate_compare_paths_map_payload(
+            path_items, slon, slat, elon, elat
+        )
+    return jsonify(payload)
 
 
 @app.route('/api/od_flow', methods=['POST'])
@@ -1241,20 +1488,24 @@ def od_region_flow():
 
 @app.route('/api/frequent_paths_global', methods=['POST'])
 def frequent_paths_global():
-    """F7: 全局 Top-k 最频繁路径（只按距离过滤）"""
+    """F7: 全局 Top-k（网格统计 + GPS 样例展示）"""
     data = request.json
     k = data.get('k', 10)
     min_distance = data.get('min_distance', 0)
-    
-    candidates = path_trie.get_top_k_paths(k=max(k * 8, 80), min_length=2)
-    result_paths = _filter_paths_by_distance(candidates, min_distance, k)
-    paths_for_map = [(p['coords'], p['count'], None) for p in result_paths]
 
+    staged = _get_global_frequent_candidates(k, min_distance, min_length=2)
+    result_paths, gps_hits = _enrich_paths_with_gps_display(staged, path_exemplars)
+    paths_for_map = [(p['display_coords'], p['count'], None) for p in result_paths]
+
+    total = len(result_paths)
     return jsonify({
         'success': True,
         'k': k,
         'min_distance': min_distance,
-        'total_paths_found': len(result_paths),
+        'total_paths_found': total,
+        'gps_display_count': gps_hits,
+        'display_hint': _gps_display_hint(gps_hits, total),
+        'exemplar_index_size': len(path_exemplars),
         'top_paths': result_paths,
         'map': generate_paths_map_payload(paths_for_map),
     })
@@ -1278,17 +1529,21 @@ def frequent_paths_between():
     start_grids = set(rect_to_grid_ids(rect1_bounds))
     end_grids = set(rect_to_grid_ids(rect2_bounds))
     
-    candidates = path_trie.get_paths_between_regions(
-        start_grids, end_grids, k=max(k * 8, 80), min_length=2
+    staged = _get_region_frequent_candidates(
+        start_grids, end_grids, k, min_distance, min_length=2
     )
-    result_paths = _filter_paths_by_distance(candidates, min_distance, k)
-    paths_for_map = [(p['coords'], p['count'], None) for p in result_paths]
+    result_paths, gps_hits = _enrich_paths_with_gps_display(staged, path_exemplars)
+    paths_for_map = [(p['display_coords'], p['count'], None) for p in result_paths]
 
+    total = len(result_paths)
     return jsonify({
         'success': True,
         'k': k,
         'min_distance': min_distance,
-        'total_paths_found': len(result_paths),
+        'total_paths_found': total,
+        'gps_display_count': gps_hits,
+        'display_hint': _gps_display_hint(gps_hits, total),
+        'exemplar_index_size': len(path_exemplars),
         'top_paths': result_paths,
         'map': generate_paths_with_regions_map_payload(paths_for_map, rect1_bounds, rect2_bounds),
     })
@@ -1332,7 +1587,7 @@ if __name__ == '__main__':
     print("   - F3: 四叉树区域搜索")
     print("   - F4: 密度分析（对数变换 + 缓存）")
     print("   - F5/F6: 分时段 OD 矩阵 + 区域高亮地图")
-    print("   - F7/F8: 频繁路径挖掘（按距离过滤）")
-    print("   - F9: 时间依赖 Dijkstra 最短路径")
+    print("   - F7/F8: 频繁路径（网格统计 + GPS 样例展示）")
+    print("   - F9: 时间依赖 Dijkstra + GPS 样例展示 + 区域/时段对比")
     print("=" * 60 + "\n")
     app.run(debug=True, port=5000, use_reloader=False)
