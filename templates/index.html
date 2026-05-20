@@ -274,6 +274,12 @@
                 <label>轨迹点采样（每 N 个点取 1 个）</label>
                 <input type="number" id="f1_point_sample" placeholder="采样间隔" value="5" min="1">
             </div>
+            <div class="form-group" id="f1_snap_group">
+                <label>
+                    <input type="checkbox" id="f1_snap_to_road">
+                    沿学习路网贴合（单车，近似马路走向）
+                </label>
+            </div>
             <button onclick="showTrajectory()" class="btn-traj">🛤️ 显示轨迹</button>
             <button onclick="resetScatterViewport()" class="btn-reset" style="margin-top: 5px;">↩️ 恢复散点视图</button>
 
@@ -307,7 +313,7 @@
                     <option value="2">平峰</option>
                 </select>
             </div>
-            <button onclick="updateDensity()" class="btn-density">📊 更新密度分析</button>
+            <button onclick="updateDensity()" class="btn-density">📊 更新密度分析（柱图+热力图）</button>
             <button onclick="showDensityStats()" class="btn-compare" style="margin-top: 5px;">📈 密度统计对比</button>
 
             <h3>📊 区域关联分析 (F5/F6)</h3>
@@ -423,10 +429,11 @@
                 • <strong>轨迹可视化 (F1)</strong>：指定车辆或采样多车，PathLayer 绘制 GPS 折线轨迹<br>
                 • <strong>地图缩放 (F2)</strong>：滚轮缩放时按视野与 zoom 自动调整点密度（四叉树 LOD）<br>
                 • <strong>区域搜索 (F3)</strong>：四叉树快速查询矩形区域内轨迹点<br>
-                • <strong>密度分析 (F4)</strong>：100×100网格，支持早/晚/平峰/全天<br>
+                • <strong>密度分析 (F4)</strong>：立体柱 + 平面热力图叠加，早/晚/平峰/全天<br>
                 • <strong>OD分析 (F5/F6)</strong>：每条网格 OD 一条拱线（最多300条，绿=出发/A→B）<br>
                 • <strong>频繁路径 (F7/F8)</strong>：先距离后 Top-K 统计；地图 GPS 样例展示<br>
-                • <strong>最短路径 (F9)</strong>：区域 A/B + 分时段 Dijkstra，地图优先 GPS 样例
+                • <strong>最短路径 (F9)</strong>：区域 A/B + 分时段 Dijkstra 路网折线<br>
+                • <strong>轨迹 (F1)</strong>：单车可勾选「沿学习路网贴合」近似马路走向
             </div>
         </div>
 
@@ -447,6 +454,8 @@
             const mode = document.getElementById('f1_mode').value;
             document.getElementById('f1_vehicle_group').style.display = mode === 'single' ? 'block' : 'none';
             document.getElementById('f1_all_group').style.display = mode === 'all' ? 'block' : 'none';
+            const snapGrp = document.getElementById('f1_snap_group');
+            if (snapGrp) snapGrp.style.display = mode === 'single' ? 'block' : 'none';
         }
 
         // F1: 轨迹可视化
@@ -464,7 +473,10 @@
             updateResult("⏳ 加载轨迹...", "info");
             try {
                 const body = { mode, point_sample, max_vehicles };
-                if (mode === 'single') body.vehicle_id = vehicle_id;
+                if (mode === 'single') {
+                    body.vehicle_id = vehicle_id;
+                    body.snap_to_road = document.getElementById('f1_snap_to_road').checked;
+                }
 
                 const resp = await fetch('/api/trajectory', {
                     method: 'POST',
@@ -477,10 +489,9 @@
                 } else {
                     const ids = data.vehicle_ids.slice(0, 5).join(', ');
                     const more = data.vehicle_count > 5 ? ` 等 ${data.vehicle_count} 辆` : '';
-                    updateResult(
-                        `✅ 已显示 ${data.vehicle_count} 条轨迹，共 ${data.point_count.toLocaleString()} 个点 (${data.query_time.toFixed(2)}秒)<br>ID: ${ids}${more}`,
-                        "success"
-                    );
+                    let msg = `✅ 已显示 ${data.vehicle_count} 条轨迹，共 ${data.point_count.toLocaleString()} 个点 (${data.query_time.toFixed(2)}秒)<br>ID: ${ids}${more}`;
+                    if (data.display_note) msg += `<br><span style="font-size:11px;color:#8b949e;">${data.display_note}</span>`;
+                    updateResult(msg, "success");
                     applyMapFromApi(data);
                 }
             } catch (e) {
@@ -522,7 +533,7 @@
                     body: JSON.stringify({ period: period === 'all' ? null : parseInt(period) })
                 });
                 const data = await resp.json();
-                updateResult(`✅ ${data.period_name}密度完成 | 点数: ${data.total_points.toLocaleString()}`, "success");
+                updateResult(`✅ ${data.period_name} 柱图+热力图 | 点数: ${data.total_points.toLocaleString()}`, "success");
                 applyMapFromApi(data);
             } catch (e) {
                 updateResult("❌ 密度计算失败", "error");
@@ -693,7 +704,7 @@
                         for (let i = 0; i < data.top_paths.length; i++) {
                             const p = data.top_paths[i];
                             const path_str = p.grid_ids.join(' → ');
-                            const gpsTag = p.display_from_gps ? ' · 地图GPS' : ' · 地图网格';
+                            const gpsTag = p.display_from_gps ? ' · 真实GPS' : ' · 网格折线';
                             html += `<div class="compare-result">
                                         <strong>#${i + 1}</strong> 频率: ${p.count} 次 | 距离: ${p.distance.toLocaleString()}m${gpsTag}<br>
                                         路径: ${path_str.length > 60 ? path_str.substring(0, 60) + '...' : path_str}
@@ -754,7 +765,7 @@
                         for (let i = 0; i < data.top_paths.length; i++) {
                             const p = data.top_paths[i];
                             const path_str = p.grid_ids.join(' → ');
-                            const gpsTag = p.display_from_gps ? ' · 地图GPS' : ' · 地图网格';
+                            const gpsTag = p.display_from_gps ? ' · 真实GPS' : ' · 网格折线';
                             html += `<div class="compare-result">
                                         <strong>#${i + 1}</strong> 频率: ${p.count} 次 | 距离: ${p.distance.toLocaleString()}m${gpsTag}<br>
                                         路径: ${path_str.length > 60 ? path_str.substring(0, 60) + '...' : path_str}
@@ -806,8 +817,9 @@
                 if (data.error) {
                     updateResult(`❌ ${data.error}`, "error");
                 } else {
-                    const gpsTag = data.display_from_gps ? ' · 地图GPS' : ' · 路网网格';
-                    updateResult(`✅ 预估时间: ${data.time_str} (${data.period})${gpsTag}`, "success");
+                    const note = data.display_note ? `<br><span style="font-size:11px;color:#8b949e;">${data.display_note}</span>` : '';
+                    const qt = data.query_time != null ? ` · ${data.query_time.toFixed(2)}s` : '';
+                    updateResult(`✅ 预估时间: ${data.time_str} (${data.period})${qt}${note}`, "success");
                     applyMapFromApi(data);
                 }
             } catch (e) {
@@ -830,12 +842,12 @@
                 });
                 const data = await resp.json();
                 const periods = data.periods || data;
-                let html = `<strong>📊 时段对比（路网 + GPS 展示）</strong><br>`;
-                if (data.gps_display_count != null) {
-                    html += `<span style="color:#8b949e;font-size:11px;">GPS 样例 ${data.gps_display_count}/3</span><br>`;
+                let html = `<strong>📊 时段对比（路网最短时间）</strong><br>`;
+                if (data.display_note) {
+                    html += `<span style="color:#8b949e;font-size:11px;">${data.display_note}</span><br>`;
                 }
                 for (const [period, info] of Object.entries(periods)) {
-                    const tag = info.display_from_gps ? ' · GPS' : ' · 网格';
+                    const tag = '';
                     html += `<div class="compare-result">${period}: ${info.time_str}${tag}</div>`;
                 }
                 document.getElementById('result').innerHTML = html;
@@ -850,6 +862,8 @@
             const colors = { error: '#f85149', success: '#3fb950', info: '#d29922' };
             div.innerHTML = `<strong>📋 结果</strong><br><span style="color: ${colors[type] || '#8b949e'}">${msg}</span>`;
         }
+
+        toggleF1VehicleInput();
     </script>
 </body>
 

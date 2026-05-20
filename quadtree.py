@@ -103,23 +103,39 @@ class QuadTree:
         return tree
     
     @classmethod
-    def build_from_generator(cls, data_loader, bounds, capacity=10):
+    def build_from_generator(cls, data_loader, bounds, capacity=10, point_stride=1):
+        """
+        从轨迹流构建四叉树。point_stride>1 时每 N 个 GPS 点取 1 个，用于全量数据控内存。
+        """
         x_min, y_min, x_max, y_max = bounds
         tree = cls(x_min, y_min, x_max, y_max, capacity)
-        total = 0
-        
+        total_read = 0
+        total_inserted = 0
+        stride = max(1, int(point_stride))
+
         print("🌳 开始构建四叉树...")
-        for batch in data_loader.load_all_points_generator(batch_size=5000):
-            for point in batch:
-                pt = (point['lon'], point['lat'], point['taxi_id'], point['timestamp'])
-                tree.insert(pt)
-            total += len(batch)
-            if total % 50000 == 0:
-                print(f"   已插入 {total:,} 个点...")
+        if stride > 1:
+            print(f"   点抽样: 1/{stride}（降低内存，F3 为近似计数）")
+        iter_fn = getattr(data_loader, 'iter_points_fast', None)
+        if iter_fn is not None:
+            point_iter = iter_fn(bounds=(x_min, y_min, x_max, y_max), point_stride=stride)
+        else:
+            point_iter = (
+                p for batch in data_loader.load_all_points_generator(batch_size=5000)
+                for p in batch
+            )
+        for point in point_iter:
+            pt = (point['lon'], point['lat'], point['taxi_id'], point['timestamp'])
+            tree.insert(pt)
+            total_inserted += 1
+            total_read += stride
+            if total_inserted % 50000 == 0:
+                print(f"   已入库 {total_inserted:,} 点（约扫描 {total_read:,}）...")
         
         stats = tree.get_stats()
         print(f"✅ 四叉树构建完成")
-        print(f"   总点数: {total:,}")
+        print(f"   扫描点数: {total_read:,}")
+        print(f"   入库点数: {total_inserted:,}")
         print(f"   节点数: {stats['nodes']}")
         print(f"   叶子节点: {stats['leaf_nodes']}")
         return tree

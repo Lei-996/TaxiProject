@@ -21,6 +21,14 @@ class TimePeriod:
     
     @classmethod
     def get_period(cls, timestamp):
+        """支持 pandas Timestamp、datetime、numpy.datetime64、字符串"""
+        from datetime import datetime
+        import pandas as pd
+
+        if isinstance(timestamp, str):
+            timestamp = datetime.fromisoformat(timestamp)
+        if not hasattr(timestamp, 'hour'):
+            timestamp = pd.Timestamp(timestamp)
         hour = timestamp.hour
         if 7 <= hour < 9:
             return cls.MORNING_PEAK

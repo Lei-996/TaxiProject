@@ -1,0 +1,12 @@
+{
+  "version": 2,
+  "sample_rate": 1.0,
+  "quadtree_point_stride": 15,
+  "vehicle_count": 10357,
+  "bounds": [
+    116.0,
+    39.4,
+    117.0,
+    40.1
+  ]
+}

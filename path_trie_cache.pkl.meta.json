@@ -1,0 +1,7 @@
+{
+  "version": 2,
+  "sample_rate": 1.0,
+  "path_trie_sample_rate": 0.3,
+  "path_exemplar_max": 300000,
+  "vehicle_count": 10357
+}

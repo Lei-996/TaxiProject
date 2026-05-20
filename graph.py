@@ -8,6 +8,7 @@ import pickle
 from collections import defaultdict
 from datetime import datetime
 import numpy as np
+import pandas as pd
 
 
 class TimePeriod:
@@ -21,6 +22,8 @@ class TimePeriod:
         """根据时间戳获取时段"""
         if isinstance(timestamp, str):
             timestamp = datetime.fromisoformat(timestamp)
+        elif not hasattr(timestamp, 'hour'):
+            timestamp = pd.Timestamp(timestamp)
         hour = timestamp.hour
         if 7 <= hour < 9:
             return cls.MORNING_PEAK
@@ -47,6 +50,8 @@ class TimeDependentGraph:
         self.nodes = {}                       # node_id -> (lon, lat)
         self.node_counter = 0
         self.edge_samples = defaultdict(dict)  # (from, to) -> {period: [times]}
+        self._spatial_index = None
+        self._spatial_cell = 0.01
     
     def add_node(self, lon, lat):
         """添加节点"""
@@ -130,16 +135,53 @@ class TimeDependentGraph:
         c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
         return R * c
     
+    def _ensure_spatial_index(self):
+        if self._spatial_index is not None:
+            return
+        index = defaultdict(list)
+        cell = self._spatial_cell
+        for node_id, (node_lon, node_lat) in self.nodes.items():
+            key = (int(node_lon / cell), int(node_lat / cell))
+            index[key].append((node_id, node_lon, node_lat))
+        self._spatial_index = index
+
     def find_nearest_node(self, lon, lat):
-        """找到距离给定点最近的节点"""
+        """找到距离给定点最近的节点（空间索引加速）"""
+        self._ensure_spatial_index()
+        cell = self._spatial_cell
+        cx, cy = int(lon / cell), int(lat / cell)
         min_dist = float('inf')
         nearest_node = None
+        for dx in range(-2, 3):
+            for dy in range(-2, 3):
+                for node_id, node_lon, node_lat in self._spatial_index.get((cx + dx, cy + dy), []):
+                    dist = self.haversine_distance(lon, lat, node_lon, node_lat)
+                    if dist < min_dist:
+                        min_dist = dist
+                        nearest_node = node_id
+        if nearest_node is not None:
+            return nearest_node, min_dist
         for node_id, (node_lon, node_lat) in self.nodes.items():
             dist = self.haversine_distance(lon, lat, node_lon, node_lat)
             if dist < min_dist:
                 min_dist = dist
                 nearest_node = node_id
         return nearest_node, min_dist
+
+    def find_nearest_node_in_rect(self, lon, lat, bounds):
+        """在矩形区域内找距 (lon,lat) 最近的路网节点；无节点时退回全局最近"""
+        x_min, y_min, x_max, y_max = bounds
+        best_id, best_dist = None, float('inf')
+        for node_id, (node_lon, node_lat) in self.nodes.items():
+            if not (x_min <= node_lon <= x_max and y_min <= node_lat <= y_max):
+                continue
+            dist = self.haversine_distance(lon, lat, node_lon, node_lat)
+            if dist < best_dist:
+                best_dist = dist
+                best_id = node_id
+        if best_id is not None:
+            return best_id, best_dist
+        return self.find_nearest_node(lon, lat)
     
     def dijkstra_time(self, start_id, end_id, period):
         """时间依赖 Dijkstra 算法"""
@@ -287,6 +329,8 @@ class TimeDependentRoadNetworkBuilder:
             neighbors = [
                 (grid_x + 1, grid_y), (grid_x - 1, grid_y),
                 (grid_x, grid_y + 1), (grid_x, grid_y - 1),
+                (grid_x + 1, grid_y + 1), (grid_x - 1, grid_y - 1),
+                (grid_x + 1, grid_y - 1), (grid_x - 1, grid_y + 1),
             ]
             for nx, ny in neighbors:
                 neighbor_key = (nx, ny)
@@ -328,23 +372,25 @@ class TimeDependentRoadNetworkBuilder:
             df = data_loader.load_vehicle_trajectory(vid)
             if df is None or len(df) < 5:
                 continue
-            
-            # 将轨迹点映射到节点序列
+
             node_sequence = []
             time_sequence = []
-            
-            for _, row in df.iterrows():
-                lon = float(row['longitude'])
-                lat = float(row['latitude'])
-                ts = row['timestamp']
-                
+            lons = df['longitude'].to_numpy(dtype=np.float64, copy=False)
+            lats = df['latitude'].to_numpy(dtype=np.float64, copy=False)
+            timestamps = df['timestamp'].to_numpy()
+
+            for i in range(len(df)):
+                lon = float(lons[i])
+                lat = float(lats[i])
+                ts = timestamps[i]
+
                 if x_min <= lon <= x_max and y_min <= lat <= y_max:
                     grid_x = int((lon - x_min) / x_step)
                     grid_y = int((lat - y_min) / y_step)
                     grid_x = min(grid_x, self.grid_size - 1)
                     grid_y = min(grid_y, self.grid_size - 1)
                     grid_key = (grid_x, grid_y)
-                    
+
                     if grid_key in grid_to_node:
                         node_sequence.append(grid_to_node[grid_key])
                         time_sequence.append(ts)
@@ -357,8 +403,12 @@ class TimeDependentRoadNetworkBuilder:
                 from_node = node_sequence[i]
                 to_node = node_sequence[i+1]
                 
-                # 时间差（秒）
-                time_diff = (time_sequence[i+1] - time_sequence[i]).total_seconds()
+                # 时间差（秒）；numpy datetime64 相减得到 timedelta64，无 total_seconds()
+                delta = time_sequence[i + 1] - time_sequence[i]
+                if hasattr(delta, 'total_seconds'):
+                    time_diff = delta.total_seconds()
+                else:
+                    time_diff = float(delta / np.timedelta64(1, 's'))
                 
                 # 过滤异常值：时间差应在 1秒 到 5分钟 之间
                 if 1 <= time_diff <= 300:

@@ -139,6 +139,18 @@ def column_layer(grid_data, max_count, period_name=''):
     }
 
 
+def heatmap_layer(grid_data, layer_id='density-heatmap', radius_pixels=50):
+    """F4 专用：平面热力图（2D，非立体柱）"""
+    return {
+        'type': 'heatmap',
+        'id': layer_id,
+        'data': grid_data,
+        'radius_pixels': radius_pixels,
+        'intensity': 1.2,
+        'threshold': 0.05,
+    }
+
+
 def polygon_layer(polygons):
     return {'type': 'polygon', 'id': 'regions', 'data': polygons}
 

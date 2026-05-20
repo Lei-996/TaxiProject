@@ -61,36 +61,71 @@ class PathTrie:
         
         return results
     
-    def get_all_paths_with_counts(self):
-        all_paths = []
+    def get_all_paths_iter(self):
+        """流式遍历所有完整路径，避免一次性装入内存"""
         stack = [(self.root, [])]
-        
         while stack:
             node, current_path = stack.pop()
             if node.is_end:
-                all_paths.append((current_path.copy(), node.end_count))
+                yield current_path.copy(), node.end_count
             for grid_id, child in node.children.items():
                 current_path.append(grid_id)
                 stack.append((child, current_path.copy()))
                 current_path.pop()
-        
-        return all_paths
-    
+
+    def get_all_paths_with_counts(self):
+        return list(self.get_all_paths_iter())
+
     def get_top_k_paths(self, k=10, min_length=3):
-        all_paths = self.get_all_paths_with_counts()
-        filtered = [(p, c) for p, c in all_paths if len(p) >= min_length]
-        filtered.sort(key=lambda x: x[1], reverse=True)
-        return filtered[:k]
-    
-    def get_paths_between_regions(self, start_grids, end_grids, k=10, min_length=2):
-        all_paths = self.get_all_paths_with_counts()
-        filtered = []
-        for path, count in all_paths:
-            if len(path) >= min_length:
+        import heapq
+        heap = []
+        for path, count in self.get_all_paths_iter():
+            if len(path) < min_length:
+                continue
+            if len(heap) < k:
+                heapq.heappush(heap, (count, path))
+            elif count > heap[0][0]:
+                heapq.heapreplace(heap, (count, path))
+        return [(p, c) for c, p in sorted(heap, key=lambda x: x[0], reverse=True)]
+
+    def get_paths_between_regions(
+        self,
+        start_grids,
+        end_grids,
+        k=10,
+        min_length=2,
+        max_depth=15,
+        max_candidates=None,
+    ):
+        """
+        DFS 剪枝：仅从起点区域网格向下搜索，到终点区域即收集，避免扫全 Trie。
+        """
+        start_grids = set(start_grids)
+        end_grids = set(end_grids)
+        if max_candidates is None:
+            max_candidates = max(k * 8, 80)
+
+        results = []
+
+        def dfs(node, path):
+            if len(results) >= max_candidates:
+                return
+            if node.is_end and len(path) >= min_length:
                 if path[0] in start_grids and path[-1] in end_grids:
-                    filtered.append((path, count))
-        filtered.sort(key=lambda x: x[1], reverse=True)
-        return filtered[:k]
+                    results.append((path.copy(), node.end_count))
+            if len(path) >= max_depth:
+                return
+            for grid_id, child in node.children.items():
+                path.append(grid_id)
+                dfs(child, path)
+                path.pop()
+
+        for grid_id, child in self.root.children.items():
+            if grid_id in start_grids:
+                dfs(child, [grid_id])
+
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results[: max(k * 3, k)]
     
     def get_stats(self):
         stats = {
@@ -251,8 +286,9 @@ class PathExemplarIndex:
     统计仍用 Trie；地图绘制回溯真实轨迹样例。
     """
 
-    def __init__(self, max_points_per_path=800):
+    def __init__(self, max_points_per_path=800, max_entries=300_000):
         self.max_points_per_path = max_points_per_path
+        self.max_entries = max(1000, int(max_entries))
         self.exemplars = {}
 
     def register(self, path_seq, trip_points):
@@ -261,6 +297,9 @@ class PathExemplarIndex:
         if len(coords) < 2:
             return
         existing = self.exemplars.get(key)
+        if existing is None:
+            if len(self.exemplars) >= self.max_entries:
+                return
         if existing is None or len(coords) > len(existing):
             self.exemplars[key] = coords
 
@@ -276,17 +315,24 @@ class PathExemplarIndex:
     def save(self, filepath):
         with open(filepath, 'wb') as f:
             pickle.dump(
-                {'exemplars': self.exemplars, 'max_points': self.max_points_per_path},
+                {
+                    'exemplars': self.exemplars,
+                    'max_points': self.max_points_per_path,
+                    'max_entries': self.max_entries,
+                },
                 f,
                 protocol=pickle.HIGHEST_PROTOCOL,
             )
         print(f"💾 路径 GPS 样例索引已保存: {filepath} ({len(self.exemplars):,} 条)")
 
     @classmethod
-    def load(cls, filepath):
+    def load(cls, filepath, max_entries=300_000):
         with open(filepath, 'rb') as f:
             data = pickle.load(f)
-        store = cls(max_points_per_path=data.get('max_points', 800))
+        store = cls(
+            max_points_per_path=data.get('max_points', 800),
+            max_entries=data.get('max_entries', max_entries),
+        )
         store.exemplars = data.get('exemplars', {})
         print(f"📂 路径 GPS 样例索引已加载: {filepath} ({len(store.exemplars):,} 条)")
         return store
@@ -298,6 +344,7 @@ def rebuild_path_exemplars(
     split_trips_func,
     exemplar_cache_file,
     sample_rate=1.0,
+    exemplar_max_entries=300_000,
 ):
     """仅重建 GPS 样例索引（Trie 已存在、缺 exemplar 缓存时用）"""
     import os
@@ -305,11 +352,12 @@ def rebuild_path_exemplars(
 
     print("📍 重建路径 GPS 样例索引（不重建 Trie）...")
     start = time.time()
-    store = PathExemplarIndex()
+    store = PathExemplarIndex(max_entries=exemplar_max_entries)
     sampled = vehicle_list[: int(len(vehicle_list) * sample_rate)]
     trip_count = 0
 
-    for vid in sampled:
+    n_vehicles = len(sampled)
+    for vi, vid in enumerate(sampled):
         df = data_loader.load_vehicle_trajectory(vid)
         if df is None or len(df) < 5:
             continue
@@ -320,8 +368,11 @@ def rebuild_path_exemplars(
             path_seq = trajectory_to_path_sequence(trip, min_grids=2)
             if len(path_seq) >= 2:
                 store.register(path_seq, trip)
-        if trip_count and trip_count % 5000 == 0:
-            print(f"   已扫描 {trip_count} 个行程，样例 {len(store):,} 条...")
+        if (vi + 1) % 25 == 0 or vi == 0 or (vi + 1) == n_vehicles:
+            print(
+                f"   车辆 {vi + 1}/{n_vehicles}, 行程 {trip_count:,}, "
+                f"样例 {len(store):,}, {time.time() - start:.0f}s"
+            )
 
     store.save(exemplar_cache_file)
     print(f"✅ GPS 样例索引完成: {len(store):,} 条, 耗时 {time.time() - start:.1f}s")
@@ -335,18 +386,21 @@ def build_path_trie(
     cache_file="path_trie_cache.pkl",
     exemplar_cache_file="path_exemplars_cache.pkl",
     sample_rate=0.3,
+    exemplar_max_entries=300_000,
     force_recompute=False,
 ):
     import os
     import time
 
-    exemplar_store = PathExemplarIndex()
+    exemplar_store = PathExemplarIndex(max_entries=exemplar_max_entries)
 
     if not force_recompute and os.path.exists(cache_file):
         try:
             trie = PathTrie.load(cache_file)
             if os.path.exists(exemplar_cache_file):
-                exemplar_store = PathExemplarIndex.load(exemplar_cache_file)
+                exemplar_store = PathExemplarIndex.load(
+                    exemplar_cache_file, max_entries=exemplar_max_entries
+                )
             if not os.path.exists(exemplar_cache_file) or len(exemplar_store) == 0:
                 print("⚠️ GPS 样例缓存缺失或为空，开始自动补建...")
                 exemplar_store = rebuild_path_exemplars(
@@ -355,6 +409,7 @@ def build_path_trie(
                     split_trips_func,
                     exemplar_cache_file,
                     sample_rate=sample_rate,
+                    exemplar_max_entries=exemplar_max_entries,
                 )
             return trie, exemplar_store
         except (EOFError, pickle.UnpicklingError, AttributeError, KeyError, OSError) as e:
@@ -372,8 +427,9 @@ def build_path_trie(
 
     trip_count = 0
     path_count = 0
+    n_vehicles = len(sampled_vehicles)
 
-    for vid in sampled_vehicles:
+    for vi, vid in enumerate(sampled_vehicles):
         df = data_loader.load_vehicle_trajectory(vid)
         if df is None or len(df) < 5:
             continue
@@ -390,10 +446,12 @@ def build_path_trie(
                 exemplar_store.register(path_seq, trip)
                 path_count += 1
 
-        if trip_count % 5000 == 0:
+        if (vi + 1) % 25 == 0 or vi == 0 or (vi + 1) == n_vehicles:
+            elapsed = time.time() - start_time
             print(
-                f"   已处理 {trip_count} 个行程，"
-                f"路径 {path_count}，GPS 样例 {len(exemplar_store):,}..."
+                f"   车辆 {vi + 1}/{n_vehicles}, 行程 {trip_count:,}, "
+                f"路径 {path_count:,}, GPS样例 {len(exemplar_store):,}, "
+                f"{elapsed:.0f}s"
             )
 
     trie.save(cache_file)

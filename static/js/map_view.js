@@ -65,6 +65,27 @@
                     getFillColor: (d) => d.color,
                     getElevation: (d) => d.count,
                 }));
+            } else if (spec.type === 'heatmap') {
+                layers.push(new deck.HeatmapLayer({
+                    id: spec.id,
+                    data: spec.data,
+                    pickable: true,
+                    radiusPixels: spec.radius_pixels ?? 50,
+                    intensity: spec.intensity ?? 1,
+                    threshold: spec.threshold ?? 0.05,
+                    colorRange: [
+                        [33, 102, 172, 0],
+                        [67, 147, 195, 180],
+                        [146, 197, 222, 200],
+                        [209, 229, 240, 220],
+                        [253, 219, 199, 230],
+                        [246, 178, 107, 240],
+                        [239, 138, 98, 250],
+                        [215, 48, 39, 255],
+                    ],
+                    getPosition: (d) => [d.lon, d.lat],
+                    getWeight: (d) => d.weight ?? d.count ?? 1,
+                }));
             } else if (spec.type === 'arc') {
                 layers.push(new deck.ArcLayer({
                     id: spec.id,
