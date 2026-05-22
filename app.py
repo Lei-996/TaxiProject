@@ -146,6 +146,10 @@ F1_MAX_POINTS_PER_VEHICLE = 3000
 F1_SNAP_KEYFRAME_STEP = 10
 F1_SNAP_MAX_SEGMENTS = 100
 
+# F9 区域间最短路径：边缘网格 + 方向剪枝 + 早停
+F9_REGION_NEAREST_K = 8
+F9_EARLY_STOP_SECONDS = 30
+
 # F5/F6 OD 弧线（每条网格路径一条弧，上限避免过密）
 OD_MAX_ARCS = 300
 F6_BALANCE_MIN_TOTAL_PATHS = 40
@@ -1356,6 +1360,249 @@ def _rect_center(rect):
     return (x_min + x_max) / 2, (y_min + y_max) / 2
 
 
+# ========== F9 区域间最短路径优化（参考同学实现） ==========
+
+def _get_valid_grids_in_region(rect_bounds):
+    x_min, y_min, x_max, y_max = rect_bounds
+    valid_grids = []
+    for grid_id in rect_to_grid_ids(rect_bounds):
+        bounds = grid_id_to_bounds(grid_id)
+        if not bounds:
+            continue
+        center_lon = (bounds[0] + bounds[2]) / 2
+        center_lat = (bounds[1] + bounds[3]) / 2
+        if x_min <= center_lon <= x_max and y_min <= center_lat <= y_max:
+            valid_grids.append(grid_id)
+    return valid_grids
+
+
+def _get_region_edge_grids_from_valid(valid_grids):
+    if not valid_grids:
+        return []
+    min_x = min(g % GRID_SIZE for g in valid_grids)
+    max_x = max(g % GRID_SIZE for g in valid_grids)
+    min_y = min(g // GRID_SIZE for g in valid_grids)
+    max_y = max(g // GRID_SIZE for g in valid_grids)
+    edge_grids = []
+    for gid in valid_grids:
+        x = gid % GRID_SIZE
+        y = gid // GRID_SIZE
+        if x == min_x or x == max_x or y == min_y or y == max_y:
+            edge_grids.append(gid)
+    return edge_grids
+
+
+def _filter_grids_by_direction(edge_grids, valid_grids, exclude_directions):
+    if not edge_grids or not exclude_directions or not valid_grids:
+        return edge_grids
+    min_x = min(g % GRID_SIZE for g in valid_grids)
+    max_x = max(g % GRID_SIZE for g in valid_grids)
+    min_y = min(g // GRID_SIZE for g in valid_grids)
+    max_y = max(g // GRID_SIZE for g in valid_grids)
+    filtered = []
+    for gid in edge_grids:
+        x = gid % GRID_SIZE
+        y = gid // GRID_SIZE
+        if 'left' in exclude_directions and x == min_x:
+            continue
+        if 'right' in exclude_directions and x == max_x:
+            continue
+        if 'bottom' in exclude_directions and y == min_y:
+            continue
+        if 'top' in exclude_directions and y == max_y:
+            continue
+        filtered.append(gid)
+    return filtered
+
+
+def _get_directional_edge_grids_exclude(rect1_bounds, rect2_bounds):
+    valid_grids1 = _get_valid_grids_in_region(rect1_bounds)
+    valid_grids2 = _get_valid_grids_in_region(rect2_bounds)
+    if not valid_grids1 or not valid_grids2:
+        return [], []
+
+    all_edge_grids1 = _get_region_edge_grids_from_valid(valid_grids1)
+    all_edge_grids2 = _get_region_edge_grids_from_valid(valid_grids2)
+
+    x_min1, y_min1, x_max1, y_max1 = rect1_bounds
+    x_min2, y_min2, x_max2, y_max2 = rect2_bounds
+    center1_x = (x_min1 + x_max1) / 2
+    center1_y = (y_min1 + y_max1) / 2
+    center2_x = (x_min2 + x_max2) / 2
+    center2_y = (y_min2 + y_max2) / 2
+    dx = center2_x - center1_x
+    dy = center2_y - center1_y
+
+    min_x1 = min(g % GRID_SIZE for g in valid_grids1)
+    max_x1 = max(g % GRID_SIZE for g in valid_grids1)
+    min_y1 = min(g // GRID_SIZE for g in valid_grids1)
+    max_y1 = max(g // GRID_SIZE for g in valid_grids1)
+    min_x2 = min(g % GRID_SIZE for g in valid_grids2)
+    max_x2 = max(g % GRID_SIZE for g in valid_grids2)
+    min_y2 = min(g // GRID_SIZE for g in valid_grids2)
+    max_y2 = max(g // GRID_SIZE for g in valid_grids2)
+
+    has_left1 = any(g % GRID_SIZE == min_x1 for g in all_edge_grids1)
+    has_right1 = any(g % GRID_SIZE == max_x1 for g in all_edge_grids1)
+    has_bottom1 = any(g // GRID_SIZE == min_y1 for g in all_edge_grids1)
+    has_top1 = any(g // GRID_SIZE == max_y1 for g in all_edge_grids1)
+    has_left2 = any(g % GRID_SIZE == min_x2 for g in all_edge_grids2)
+    has_right2 = any(g % GRID_SIZE == max_x2 for g in all_edge_grids2)
+    has_bottom2 = any(g // GRID_SIZE == min_y2 for g in all_edge_grids2)
+    has_top2 = any(g // GRID_SIZE == max_y2 for g in all_edge_grids2)
+
+    exclude1, exclude2 = [], []
+    if abs(dx) > abs(dy):
+        if dx > 0:
+            if has_left1 and len(all_edge_grids1) > 4:
+                exclude1 = ['left']
+            if has_right2 and len(all_edge_grids2) > 4:
+                exclude2 = ['right']
+        else:
+            if has_right1 and len(all_edge_grids1) > 4:
+                exclude1 = ['right']
+            if has_left2 and len(all_edge_grids2) > 4:
+                exclude2 = ['left']
+    else:
+        if dy > 0:
+            if has_bottom1 and len(all_edge_grids1) > 4:
+                exclude1 = ['bottom']
+            if has_top2 and len(all_edge_grids2) > 4:
+                exclude2 = ['top']
+        else:
+            if has_top1 and len(all_edge_grids1) > 4:
+                exclude1 = ['top']
+            if has_bottom2 and len(all_edge_grids2) > 4:
+                exclude2 = ['bottom']
+
+    grids1 = _filter_grids_by_direction(all_edge_grids1, valid_grids1, exclude1)
+    grids2 = _filter_grids_by_direction(all_edge_grids2, valid_grids2, exclude2)
+    if not grids1:
+        grids1 = all_edge_grids1
+    if not grids2:
+        grids2 = all_edge_grids2
+    return grids1, grids2
+
+
+def _grids_to_centers(grid_ids):
+    centers = []
+    for grid_id in grid_ids:
+        bounds = grid_id_to_bounds(grid_id)
+        if bounds:
+            centers.append({
+                'grid_id': grid_id,
+                'lon': (bounds[0] + bounds[2]) / 2,
+                'lat': (bounds[1] + bounds[3]) / 2,
+            })
+    return centers
+
+
+def _find_nearest_grid_centers(center_lon, center_lat, target_centers, k=F9_REGION_NEAREST_K):
+    distances = []
+    for c in target_centers:
+        dist = ((c['lon'] - center_lon) ** 2 + (c['lat'] - center_lat) ** 2) ** 0.5
+        distances.append((dist, c))
+    distances.sort(key=lambda x: x[0])
+    return [c for _, c in distances[:min(k, len(distances))]]
+
+
+def find_shortest_path_between_regions_optimized(rect1_bounds, rect2_bounds, period):
+    """区域 A→B：边缘网格候选 + 方向剪枝 + 有限 Dijkstra + 早停"""
+    grids1, grids2 = _get_directional_edge_grids_exclude(rect1_bounds, rect2_bounds)
+    centers1 = _grids_to_centers(grids1)
+    centers2 = _grids_to_centers(grids2)
+    if not centers1 or not centers2:
+        return None, None, None, None, 0
+
+    k = min(F9_REGION_NEAREST_K, max(len(centers1), len(centers2)))
+    best_path = None
+    best_time = float('inf')
+    best_start = None
+    best_end = None
+    computed = set()
+    total_calculations = 0
+    early_stop = False
+
+    if len(centers1) <= len(centers2):
+        for c1 in centers1:
+            if early_stop:
+                break
+            nearest = _find_nearest_grid_centers(c1['lon'], c1['lat'], centers2, k)
+            start_node, _ = graph.find_nearest_node(c1['lon'], c1['lat'])
+            if start_node is None:
+                continue
+            for c2 in nearest:
+                pair_key = (c1['grid_id'], c2['grid_id'])
+                if pair_key in computed:
+                    continue
+                computed.add(pair_key)
+                total_calculations += 1
+                end_node, _ = graph.find_nearest_node(c2['lon'], c2['lat'])
+                if end_node is None:
+                    continue
+                path, total_time = graph.dijkstra_time(start_node, end_node, period)
+                if path and total_time < best_time:
+                    best_time = total_time
+                    best_path = path
+                    best_start = c1
+                    best_end = c2
+                    if best_time < F9_EARLY_STOP_SECONDS:
+                        early_stop = True
+                        break
+    else:
+        for c2 in centers2:
+            if early_stop:
+                break
+            nearest = _find_nearest_grid_centers(c2['lon'], c2['lat'], centers1, k)
+            end_node, _ = graph.find_nearest_node(c2['lon'], c2['lat'])
+            if end_node is None:
+                continue
+            for c1 in nearest:
+                pair_key = (c1['grid_id'], c2['grid_id'])
+                if pair_key in computed:
+                    continue
+                computed.add(pair_key)
+                total_calculations += 1
+                start_node, _ = graph.find_nearest_node(c1['lon'], c1['lat'])
+                if start_node is None:
+                    continue
+                path, total_time = graph.dijkstra_time(start_node, end_node, period)
+                if path and total_time < best_time:
+                    best_time = total_time
+                    best_path = path
+                    best_start = c1
+                    best_end = c2
+                    if best_time < F9_EARLY_STOP_SECONDS:
+                        early_stop = True
+                        break
+
+    return best_path, best_time, best_start, best_end, total_calculations
+
+
+def _compare_periods_between_regions_optimized(rect1_bounds, rect2_bounds):
+    """各时段最短时间（在边缘网格对上快速估计，避免三次全量搜索）"""
+    grids1, grids2 = _get_directional_edge_grids_exclude(rect1_bounds, rect2_bounds)
+    centers1 = _grids_to_centers(grids1)
+    centers2 = _grids_to_centers(grids2)
+    best_times = {p: float('inf') for p in TimePeriod.get_all_periods()}
+    if not centers1 or not centers2:
+        return best_times
+
+    for period in TimePeriod.get_all_periods():
+        for c1 in centers1:
+            start_node, _ = graph.find_nearest_node(c1['lon'], c1['lat'])
+            if start_node is None:
+                continue
+            for c2 in _find_nearest_grid_centers(c1['lon'], c1['lat'], centers2, 5):
+                end_node, _ = graph.find_nearest_node(c2['lon'], c2['lat'])
+                if end_node is None:
+                    continue
+                _, t = graph.dijkstra_time(start_node, end_node, period)
+                if t and t < best_times[period]:
+                    best_times[period] = t
+    return best_times
+
+
 def _parse_f9_points(data):
     """F9: 支持矩形区域中心或起终点坐标"""
     rect1, rect2 = data.get('rect1'), data.get('rect2')
@@ -1448,6 +1695,56 @@ def _generate_shortest_path_map_payload(path_coords, color=None, layer_id='short
         [p[0] for p in path_coords],
         [p[1] for p in path_coords],
     )
+    return build_payload(vs, layers, '{type}', lock_viewport=True)
+
+
+def _generate_f9_region_path_map_payload(
+    path_coords, rect1_bounds, rect2_bounds, best_start=None, best_end=None,
+):
+    """F9 区域模式：A/B 高亮 + 最优起终点网格 + 路网折线"""
+    x_min1, y_min1, x_max1, y_max1 = rect1_bounds
+    x_min2, y_min2, x_max2, y_max2 = rect2_bounds
+    layers = [
+        polygon_layer([{
+            'polygon': [[x_min1, y_min1], [x_max1, y_min1], [x_max1, y_max1], [x_min1, y_max1]],
+            'fill_color': [0, 200, 0, 15],
+            'line_color': [0, 255, 0, 255],
+        }], layer_id='f9-region-a', line_width_min_pixels=2),
+        polygon_layer([{
+            'polygon': [[x_min2, y_min2], [x_max2, y_min2], [x_max2, y_max2], [x_min2, y_max2]],
+            'fill_color': [255, 100, 0, 15],
+            'line_color': [255, 100, 0, 255],
+        }], layer_id='f9-region-b', line_width_min_pixels=2),
+    ]
+    markers = []
+    if best_start:
+        markers.append({
+            'lon': best_start['lon'],
+            'lat': best_start['lat'],
+            'type': f"最优起点(网格{best_start['grid_id']})",
+            'color': [0, 255, 0, 255],
+        })
+    if best_end:
+        markers.append({
+            'lon': best_end['lon'],
+            'lat': best_end['lat'],
+            'type': f"最优终点(网格{best_end['grid_id']})",
+            'color': [255, 120, 0, 255],
+        })
+    if markers:
+        layers.append(scatter_layer(markers, layer_id='f9-optimal-grids', radius=80))
+    if path_coords and len(path_coords) >= 2:
+        layers.append(path_layer([{
+            'path': path_coords,
+            'color': [255, 100, 50, 255],
+            'width': 5,
+        }], 'f9-shortest-path'))
+    all_lons = [x_min1, x_max1, x_min2, x_max2]
+    all_lats = [y_min1, y_max1, y_min2, y_max2]
+    if path_coords:
+        all_lons.extend(p[0] for p in path_coords)
+        all_lats.extend(p[1] for p in path_coords)
+    vs = view_state_for_coords(all_lons, all_lats)
     return build_payload(vs, layers, '{type}', lock_viewport=True)
 
 
@@ -2098,19 +2395,55 @@ def normal_view():
 def shortest_path():
     start = time.time()
     data = request.json or {}
-    slon, slat, elon, elat = _parse_f9_points(data)
     period = data.get('period', TimePeriod.OFF_PEAK)
+    rect1, rect2 = data.get('rect1'), data.get('rect2')
 
+    if rect1 and rect2:
+        rect1_bounds = _rect_bounds_from_dict(rect1)
+        rect2_bounds = _rect_bounds_from_dict(rect2)
+        best_path, total_time, best_start, best_end, calc_count = (
+            find_shortest_path_between_regions_optimized(rect1_bounds, rect2_bounds, period)
+        )
+        if best_path is None or total_time == float('inf'):
+            return jsonify({'error': '未找到路径'}), 400
+
+        coords, from_gps = _resolve_graph_path_display(best_path)
+        elapsed = time.time() - start
+        time_str = f"{total_time/60:.1f}分钟" if total_time > 60 else f"{total_time:.0f}秒"
+        period_name = TimePeriod.get_period_name(period)
+        print(
+            f"🛣️ [F9区域优化] {time_str}, {period_name}, "
+            f"Dijkstra×{calc_count}, 节点{len(best_path)}, 耗时{elapsed:.3f}s"
+        )
+        return jsonify({
+            'success': True,
+            'time_seconds': round(total_time),
+            'time_str': time_str,
+            'period': period_name,
+            'node_count': len(best_path),
+            'start_grid': best_start['grid_id'],
+            'end_grid': best_end['grid_id'],
+            'dijkstra_calls': calc_count,
+            'display_from_gps': from_gps,
+            'display_note': (
+                f'区域边缘网格优化搜索（{calc_count} 次 Dijkstra）；'
+                f'绿/橙大点为最优起终点网格 {best_start["grid_id"]}→{best_end["grid_id"]}'
+            ),
+            'query_time': elapsed,
+            'map': _generate_f9_region_path_map_payload(
+                coords, rect1_bounds, rect2_bounds, best_start, best_end,
+            ),
+        })
+
+    slon, slat, elon, elat = _parse_f9_points(data)
     if None in [slon, slat, elon, elat]:
         return jsonify({'error': '缺少起点/终点（坐标或矩形区域）'}), 400
 
     start_node, end_node, _, _ = _f9_resolve_endpoints(data, slon, slat, elon, elat)
-
     if start_node is None or end_node is None:
         return jsonify({'error': '无法找到附近路网节点'}), 400
 
     path, total_time = graph.dijkstra_time(start_node, end_node, period)
-
     if path is None:
         return jsonify({'error': '未找到路径'}), 400
 
@@ -2118,12 +2451,10 @@ def shortest_path():
     elapsed = time.time() - start
     time_str = f"{total_time/60:.1f}分钟" if total_time > 60 else f"{total_time:.0f}秒"
     period_name = TimePeriod.get_period_name(period)
-
     print(
         f"🛣️ 路径: {len(path)}节点, {time_str}, {period_name}, "
         f"路网节点{len(path)}, 耗时{elapsed:.3f}s"
     )
-
     return jsonify({
         'success': True,
         'time_seconds': round(total_time),
@@ -2131,10 +2462,7 @@ def shortest_path():
         'period': period_name,
         'node_count': len(path),
         'display_from_gps': from_gps,
-        'display_note': (
-            '时间为学习路网上的最短时间（Dijkstra）；'
-            '绿/红点为路径端点（区域内最近路网节点）'
-        ),
+        'display_note': '时间为学习路网上的最短时间（单点 Dijkstra）',
         'query_time': elapsed,
         'map': _generate_shortest_path_map_payload(coords),
     })
@@ -2143,13 +2471,32 @@ def shortest_path():
 @app.route('/api/compare_paths', methods=['POST'])
 def compare_paths():
     data = request.json or {}
-    slon, slat, elon, elat = _parse_f9_points(data)
+    rect1, rect2 = data.get('rect1'), data.get('rect2')
 
+    if rect1 and rect2:
+        rect1_bounds = _rect_bounds_from_dict(rect1)
+        rect2_bounds = _rect_bounds_from_dict(rect2)
+        best_times = _compare_periods_between_regions_optimized(rect1_bounds, rect2_bounds)
+        results = {}
+        for period in TimePeriod.get_all_periods():
+            t = best_times[period]
+            if t != float('inf'):
+                results[TimePeriod.get_period_name(period)] = {
+                    'time_seconds': round(t),
+                    'time_str': f"{t/60:.1f}分钟" if t > 60 else f"{t:.0f}秒",
+                }
+        if not results:
+            return jsonify({'error': '未找到任一时段路径'}), 400
+        return jsonify({
+            'periods': results,
+            'display_note': '各时段在区域边缘网格上的最短时间估计（快速对比）',
+        })
+
+    slon, slat, elon, elat = _parse_f9_points(data)
     if None in [slon, slat, elon, elat]:
         return jsonify({'error': '缺少起点/终点（坐标或矩形区域）'}), 400
 
     start_node, end_node, _, _ = _f9_resolve_endpoints(data, slon, slat, elon, elat)
-
     if start_node is None or end_node is None:
         return jsonify({'error': '无法找到附近路网节点'}), 400
 
@@ -2184,7 +2531,7 @@ def compare_paths():
     }
     if path_items:
         payload['map'] = _generate_compare_paths_map_payload(path_items)
-        payload['display_note'] = '各时段最短时间路径（路网 Dijkstra），起终点为路径端点'
+        payload['display_note'] = '各时段最短时间路径（单点 Dijkstra）'
     return jsonify(payload)
 
 
@@ -2395,6 +2742,6 @@ if __name__ == '__main__':
     print("   - F4: 密度分析（对数变换 + 缓存）")
     print("   - F5/F6: 分时段 OD 矩阵 + 区域高亮地图")
     print("   - F7/F8: 频繁路径（网格统计 + GPS 样例展示）")
-    print("   - F9: 时间依赖 Dijkstra + GPS 样例展示 + 区域/时段对比")
+    print("   - F9: 区域边缘网格优化 Dijkstra + A/B 高亮与最优网格起终点")
     print("=" * 60 + "\n")
     app.run(debug=True, port=5000, use_reloader=False)
