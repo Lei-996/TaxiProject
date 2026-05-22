@@ -313,6 +313,14 @@
                     <option value="2">平峰</option>
                 </select>
             </div>
+            <div class="form-group">
+                <label>边界扩展（相对研究范围）</label>
+                <select id="density_expand_ratio">
+                    <option value="0.05">5%</option>
+                    <option value="0.10" selected>10%（默认）</option>
+                    <option value="0.15">15%</option>
+                </select>
+            </div>
             <button onclick="updateDensity()" class="btn-density">📊 更新密度分析（柱图+热力图）</button>
             <button onclick="showDensityStats()" class="btn-compare" style="margin-top: 5px;">📈 密度统计对比</button>
 
@@ -426,14 +434,14 @@
             </div>
             <div class="info">
                 💡 功能说明：<br>
-                • <strong>轨迹可视化 (F1)</strong>：指定车辆或采样多车，PathLayer 绘制 GPS 折线轨迹<br>
+                • <strong>轨迹可视化 (F1)</strong>：GPS 黄点 + 橙红折线；单车可勾选路网贴合<br>
                 • <strong>地图缩放 (F2)</strong>：滚轮缩放时按视野与 zoom 自动调整点密度（四叉树 LOD）<br>
                 • <strong>区域搜索 (F3)</strong>：四叉树快速查询矩形区域内轨迹点<br>
-                • <strong>密度分析 (F4)</strong>：立体柱 + 平面热力图叠加，早/晚/平峰/全天<br>
+                • <strong>密度分析 (F4)</strong>：立体柱+热力图，可选边界扩展 5%/10%/15%<br>
                 • <strong>OD分析 (F5/F6)</strong>：每条网格 OD 一条拱线（最多300条，绿=出发/A→B）<br>
                 • <strong>频繁路径 (F7/F8)</strong>：先距离后 Top-K 统计；地图 GPS 样例展示<br>
                 • <strong>最短路径 (F9)</strong>：区域 A/B + 分时段 Dijkstra 路网折线<br>
-                • <strong>轨迹 (F1)</strong>：单车可勾选「沿学习路网贴合」近似马路走向
+                • <strong>轨迹 (F1)</strong>：默认原始 GPS 折线；勾选路网贴合会改成沿学习路网走
             </div>
         </div>
 
@@ -525,15 +533,23 @@
         // 密度分析
         async function updateDensity() {
             const period = document.getElementById('density_period').value;
+            const expand_ratio = parseFloat(document.getElementById('density_expand_ratio').value) || 0.10;
             updateResult("⏳ 计算密度分析...", "info");
             try {
                 const resp = await fetch('/api/density_by_period', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ period: period === 'all' ? null : parseInt(period) })
+                    body: JSON.stringify({
+                        period: period === 'all' ? null : parseInt(period),
+                        expand_ratio,
+                    })
                 });
                 const data = await resp.json();
-                updateResult(`✅ ${data.period_name} 柱图+热力图 | 点数: ${data.total_points.toLocaleString()}`, "success");
+                const expPct = Math.round((data.expand_ratio || expand_ratio) * 100);
+                updateResult(
+                    `✅ ${data.period_name} 柱图+热力图 | 扩展 ${expPct}% | 点数: ${data.total_points.toLocaleString()}`,
+                    "success"
+                );
                 applyMapFromApi(data);
             } catch (e) {
                 updateResult("❌ 密度计算失败", "error");
@@ -541,12 +557,15 @@
         }
 
         async function showDensityStats() {
+            const expand_ratio = parseFloat(document.getElementById('density_expand_ratio').value) || 0.10;
             updateResult("⏳ 获取密度统计...", "info");
             try {
-                const resp = await fetch('/api/density_stats');
+                const resp = await fetch(`/api/density_stats?expand_ratio=${expand_ratio}`);
                 const data = await resp.json();
-                let html = `<strong>📊 密度统计对比 (100×100网格)</strong><br>`;
-                for (const stat of data) {
+                const stats = data.stats || data;
+                const expPct = Math.round((data.expand_ratio || expand_ratio) * 100);
+                let html = `<strong>📊 密度统计 (扩展 ${expPct}%)</strong><br>`;
+                for (const stat of stats) {
                     html += `<div class="compare-result">${stat.name}: ${stat.total_points.toLocaleString()} 点</div>`;
                 }
                 document.getElementById('result').innerHTML = html;
@@ -635,6 +654,13 @@
                     let arcInfo = `已绘制 ${data.arcs_drawn || 0} 条路径弧线`;
                     if (data.path_count > data.arcs_drawn) {
                         arcInfo += `（共 ${data.path_count} 条，显示流量最高的 ${data.arcs_drawn} 条）`;
+                    }
+                    const mapMeta = (data.map && data.map.meta) || {};
+                    if (mapMeta.balance_mode) {
+                        arcInfo += '；已启用方向均衡采样';
+                    }
+                    if (mapMeta.boundary_hint) {
+                        arcInfo += `；${mapMeta.boundary_hint}`;
                     }
                     if (period === 'all') {
                         let html = `<strong>📊 区域流量分析（分时段）</strong><br>`;

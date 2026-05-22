@@ -148,6 +148,10 @@ F1_SNAP_MAX_SEGMENTS = 100
 
 # F5/F6 OD 弧线（每条网格路径一条弧，上限避免过密）
 OD_MAX_ARCS = 300
+F6_BALANCE_MIN_TOTAL_PATHS = 40
+F6_BALANCE_DIRECTION_IMBALANCE_THRESHOLD = 0.72
+F6_BALANCE_EDGE_MARGIN_RATIO = 0.08
+F6_GPS_BACKTRACK_REPLACE_RATIO_CAP = 0.35
 
 BOUNDS = (116.0, 39.4, 117.0, 40.1)
 
@@ -468,125 +472,196 @@ if len(path_exemplars) == 0:
 # ========== 密度分析 ==========
 _density_cache = {}
 
-def get_density_cache_filename(period):
+F4_EXPAND_RATIOS = [0.05, 0.10, 0.15]
+F4_DEFAULT_EXPAND_RATIO = 0.10
+
+
+def _normalize_f4_expand_ratio(expand_ratio):
+    """F4: 仅允许 5%/10%/15%，默认 10%"""
+    try:
+        ratio = float(expand_ratio)
+    except (TypeError, ValueError):
+        return F4_DEFAULT_EXPAND_RATIO
+    for allowed in F4_EXPAND_RATIOS:
+        if abs(ratio - allowed) < 1e-9:
+            return allowed
+    return F4_DEFAULT_EXPAND_RATIO
+
+
+def _get_f4_expanded_bounds(expand_ratio):
+    """在全局 BOUNDS 基础上统一扩展边界（仅 F4 使用）"""
+    ratio = _normalize_f4_expand_ratio(expand_ratio)
+    x_min, y_min, x_max, y_max = BOUNDS
+    dx = (x_max - x_min) * ratio
+    dy = (y_max - y_min) * ratio
+    return (x_min - dx, y_min - dy, x_max + dx, y_max + dy), ratio
+
+
+def get_density_cache_filename(period, expand_ratio):
     period_names = {
         None: 'all',
         TimePeriod.MORNING_PEAK: 'morning',
         TimePeriod.EVENING_PEAK: 'evening',
         TimePeriod.OFF_PEAK: 'offpeak'
     }
-    return f"density_cache_{DENSITY_GRID_SIZE}x{DENSITY_GRID_SIZE}_{period_names.get(period, 'unknown')}.pkl"
+    ratio = _normalize_f4_expand_ratio(expand_ratio)
+    ratio_pct = int(round(ratio * 100))
+    return (
+        f"density_cache_{DENSITY_GRID_SIZE}x{DENSITY_GRID_SIZE}_"
+        f"{period_names.get(period, 'unknown')}_f4exp{ratio_pct}.pkl"
+    )
 
-def compute_density_for_period(period, force_recompute=False):
-    cache_file = get_density_cache_filename(period)
 
-    if not force_recompute and os.path.exists(cache_file):
-        print(f"📂 加载密度缓存: {cache_file}")
-        start = time.time()
-        with open(cache_file, 'rb') as f:
-            grid_data, max_count, total_points = pickle.load(f)
-        print(f"✅ 密度缓存加载完成，耗时 {time.time()-start:.2f} 秒")
-        print(f"   非空网格: {len(grid_data)}")
-        return grid_data, max_count, total_points
+def _density_ratio_files_complete(ratio):
+    period_list = TimePeriod.get_all_periods()
+    files = [get_density_cache_filename(p, ratio) for p in period_list]
+    files.append(get_density_cache_filename(None, ratio))
+    return all(os.path.exists(f) for f in files)
 
-    period_name = TimePeriod.get_period_name(period)
-    print(f"📊 计算密度网格: {DENSITY_GRID_SIZE}x{DENSITY_GRID_SIZE}, 时段={period_name}")
+
+def _load_density_bundle_from_disk(ratio):
+    """从磁盘加载某一扩展比例的三时段+全天缓存到内存"""
+    period_list = TimePeriod.get_all_periods()
+    if not _density_ratio_files_complete(ratio):
+        return None
+    bundle = {}
+    for p in period_list:
+        with open(get_density_cache_filename(p, ratio), 'rb') as f:
+            bundle[p] = pickle.load(f)
+    with open(get_density_cache_filename(None, ratio), 'rb') as f:
+        bundle[None] = pickle.load(f)
+    _density_cache[('bundle', ratio)] = bundle
+    return bundle
+
+
+def _build_density_bundle(expand_ratio=F4_DEFAULT_EXPAND_RATIO, force_recompute=False):
+    """F4: 按最大扩展(15%)单次扫描，构建 5/10/15% 三套三时段+全天缓存"""
+    ratio = _normalize_f4_expand_ratio(expand_ratio)
+    bundle_key = ('bundle', ratio)
+    if bundle_key in _density_cache and not force_recompute:
+        return _density_cache[bundle_key]
+
+    period_list = TimePeriod.get_all_periods()
+
+    if not force_recompute:
+        for r in F4_EXPAND_RATIOS:
+            if ('bundle', r) not in _density_cache:
+                loaded = _load_density_bundle_from_disk(r)
+                if loaded:
+                    print(f"📂 F4 密度缓存已加载(扩展={int(round(r * 100))}%)")
+        if bundle_key in _density_cache:
+            return _density_cache[bundle_key]
+
+    max_ratio = max(F4_EXPAND_RATIOS)
+    max_bounds, _ = _get_f4_expanded_bounds(max_ratio)
+
+    ratio_cfg = {}
+    for r in F4_EXPAND_RATIOS:
+        b, _ = _get_f4_expanded_bounds(r)
+        x0, y0, x1, y1 = b
+        x_step = (x1 - x0) / DENSITY_GRID_SIZE
+        y_step = (y1 - y0) / DENSITY_GRID_SIZE
+        ratio_cfg[r] = {
+            'bounds': b,
+            'x0': x0, 'y0': y0, 'x1': x1, 'y1': y1,
+            'x_step': x_step, 'y_step': y_step,
+            'counts': {p: defaultdict(int) for p in period_list},
+            'totals': {p: 0 for p in period_list},
+        }
+
+    print(
+        f"📊 F4 单次扫描构建多扩展缓存: {DENSITY_GRID_SIZE}x{DENSITY_GRID_SIZE}, "
+        f"扩展={','.join(str(int(r*100))+'%' for r in F4_EXPAND_RATIOS)}"
+    )
     start_time = time.time()
 
-    x_min, y_min, x_max, y_max = BOUNDS
-    x_step = (x_max - x_min) / DENSITY_GRID_SIZE
-    y_step = (y_max - y_min) / DENSITY_GRID_SIZE
-
-    grid_counts = defaultdict(int)
-    total_points = 0
-
-    for point in data_loader.iter_points_fast(bounds=BOUNDS, point_stride=1):
-        ts = point['timestamp']
-        point_period = TimePeriod.get_period(ts)
-        if point_period != period:
+    scanned = 0
+    for point in data_loader.iter_points_fast(bounds=max_bounds, point_stride=1):
+        p = TimePeriod.get_period(point['timestamp'])
+        if p not in period_list:
             continue
         lon = point['lon']
         lat = point['lat']
-        grid_x = int((lon - x_min) / x_step)
-        grid_y = int((lat - y_min) / y_step)
-        grid_x = min(grid_x, DENSITY_GRID_SIZE - 1)
-        grid_y = min(grid_y, DENSITY_GRID_SIZE - 1)
-        grid_counts[(grid_x, grid_y)] += 1
-        total_points += 1
-        if total_points % 500_000 == 0:
-            print(f"   密度已统计 {total_points:,} 点...")
 
-    raw_max_count = max(grid_counts.values()) if grid_counts else 1
-    log_max = math.log(raw_max_count + 1)
+        # 扩展边界嵌套：15% ⊃ 10% ⊃ 5%，从外到内判断，减少无效网格计算
+        for r in reversed(F4_EXPAND_RATIOS):
+            cfg = ratio_cfg[r]
+            if not (cfg['x0'] <= lon < cfg['x1'] and cfg['y0'] <= lat < cfg['y1']):
+                break
+            grid_x = int((lon - cfg['x0']) / cfg['x_step'])
+            grid_y = int((lat - cfg['y0']) / cfg['y_step'])
+            grid_x = max(0, min(grid_x, DENSITY_GRID_SIZE - 1))
+            grid_y = max(0, min(grid_y, DENSITY_GRID_SIZE - 1))
+            cfg['counts'][p][(grid_x, grid_y)] += 1
+            cfg['totals'][p] += 1
 
-    grid_data = []
-    for (grid_x, grid_y), count in grid_counts.items():
-        center_lon = x_min + (grid_x + 0.5) * x_step
-        center_lat = y_min + (grid_y + 0.5) * y_step
-        log_count = math.log(count + 1)
-        intensity = log_count / log_max if log_max > 0 else 0
+        scanned += 1
+        if scanned % 2_000_000 == 0:
+            print(f"   F4 已扫描 {scanned:,} 点...")
 
-        grid_data.append({
-            'lon': center_lon,
-            'lat': center_lat,
-            'count': count,
-            'intensity': intensity
-        })
+    for r in F4_EXPAND_RATIOS:
+        cfg = ratio_cfg[r]
+        per_files = {p: get_density_cache_filename(p, r) for p in period_list}
+        all_file = get_density_cache_filename(None, r)
+        rbundle = {}
 
-    with open(cache_file, 'wb') as f:
-        pickle.dump((grid_data, raw_max_count, total_points), f)
+        for p in period_list:
+            counts = cfg['counts'][p]
+            raw_max = max(counts.values()) if counts else 1
+            log_max = math.log(raw_max + 1)
+            grid_data = []
+            for (gx, gy), count in counts.items():
+                center_lon = cfg['x0'] + (gx + 0.5) * cfg['x_step']
+                center_lat = cfg['y0'] + (gy + 0.5) * cfg['y_step']
+                intensity = (math.log(count + 1) / log_max) if log_max > 0 else 0
+                grid_data.append({'lon': center_lon, 'lat': center_lat, 'count': count, 'intensity': intensity})
+            rbundle[p] = (grid_data, raw_max, cfg['totals'][p])
+            with open(per_files[p], 'wb') as f:
+                pickle.dump(rbundle[p], f)
+
+        all_counts = defaultdict(int)
+        all_total = 0
+        for p in period_list:
+            for (gx, gy), c in cfg['counts'][p].items():
+                all_counts[(gx, gy)] += c
+            all_total += cfg['totals'][p]
+        all_raw_max = max(all_counts.values()) if all_counts else 1
+        all_log_max = math.log(all_raw_max + 1)
+        all_grid_data = []
+        for (gx, gy), count in all_counts.items():
+            center_lon = cfg['x0'] + (gx + 0.5) * cfg['x_step']
+            center_lat = cfg['y0'] + (gy + 0.5) * cfg['y_step']
+            intensity = (math.log(count + 1) / all_log_max) if all_log_max > 0 else 0
+            all_grid_data.append({'lon': center_lon, 'lat': center_lat, 'count': count, 'intensity': intensity})
+        rbundle[None] = (all_grid_data, all_raw_max, all_total)
+        with open(all_file, 'wb') as f:
+            pickle.dump(rbundle[None], f)
+
+        _density_cache[('bundle', r)] = rbundle
 
     elapsed = time.time() - start_time
-    print(f"✅ 密度计算完成，耗时 {elapsed:.2f} 秒")
-    print(f"   总点数: {total_points:,}")
-    print(f"   非空网格: {len(grid_data)}")
-    print(f"   原始最大密度: {raw_max_count}")
+    print(f"✅ F4 多扩展缓存构建完成，耗时 {elapsed:.2f} 秒")
+    return _density_cache[bundle_key]
 
-    return grid_data, raw_max_count, total_points
 
-def get_density_data_by_period(period, force_recompute=False):
+def compute_density_for_period(period, expand_ratio=F4_DEFAULT_EXPAND_RATIO, force_recompute=False):
+    bundle = _build_density_bundle(expand_ratio=expand_ratio, force_recompute=force_recompute)
+    return bundle[period]
+
+
+def get_density_data_by_period(period, expand_ratio=F4_DEFAULT_EXPAND_RATIO, force_recompute=False):
     if period not in [0, 1, 2]:
         raise ValueError(f"无效的时段: {period}")
-    cache_key = period
+    ratio = _normalize_f4_expand_ratio(expand_ratio)
+    cache_key = (period, ratio)
     if cache_key not in _density_cache or force_recompute:
-        _density_cache[cache_key] = compute_density_for_period(period, force_recompute)
+        _density_cache[cache_key] = compute_density_for_period(period, ratio, force_recompute)
     return _density_cache[cache_key]
 
-def get_all_day_density():
-    print("📊 计算全天密度（从三个时段累加）...")
-    start_time = time.time()
 
-    morning_data, _, morning_total = get_density_data_by_period(TimePeriod.MORNING_PEAK)
-    evening_data, _, evening_total = get_density_data_by_period(TimePeriod.EVENING_PEAK)
-    offpeak_data, _, offpeak_total = get_density_data_by_period(TimePeriod.OFF_PEAK)
-
-    grid_counts = {}
-    for data in [morning_data, evening_data, offpeak_data]:
-        for item in data:
-            key = (item['lon'], item['lat'])
-            grid_counts[key] = grid_counts.get(key, 0) + item['count']
-
-    raw_max_count = max(grid_counts.values()) if grid_counts else 1
-    log_max = math.log(raw_max_count + 1)
-
-    grid_data = []
-    for (lon, lat), count in grid_counts.items():
-        log_count = math.log(count + 1)
-        intensity = log_count / log_max if log_max > 0 else 0
-        grid_data.append({
-            'lon': lon,
-            'lat': lat,
-            'count': count,
-            'intensity': intensity
-        })
-
-    total_points = morning_total + evening_total + offpeak_total
-    elapsed = time.time() - start_time
-    print(f"✅ 全天密度计算完成，耗时 {elapsed:.2f} 秒")
-    print(f"   总点数: {total_points:,}")
-    print(f"   非空网格: {len(grid_data)}")
-
-    return grid_data, raw_max_count, total_points
+def get_all_day_density(expand_ratio=F4_DEFAULT_EXPAND_RATIO, force_recompute=False):
+    bundle = _build_density_bundle(expand_ratio=expand_ratio, force_recompute=force_recompute)
+    return bundle[None]
 
 
 def get_color_from_intensity(intensity):
@@ -1101,12 +1176,13 @@ def _cached_path_distance(path):
     return distance
 
 
-def _select_frequent_paths_by_distance(path_iter, k, min_distance, min_length=2):
+def _select_frequent_paths_by_distance(path_iter, k, min_distance, min_length=2, favor_long_paths=False):
     """先按地理距离过滤，用小顶堆维护 Top-K（流式，不全量排序）"""
     heap = []
     seq = 0
     for path, count in path_iter:
-        if len(path) < min_length:
+        path_len = len(path)
+        if path_len < min_length:
             continue
         distance = _cached_path_distance(path)
         if distance < min_distance:
@@ -1116,13 +1192,82 @@ def _select_frequent_paths_by_distance(path_iter, k, min_distance, min_length=2)
             'count': count,
             'distance': round(distance),
             'grid_coords': _grid_path_coords(path),
+            'path_len': path_len,
         }
         seq += 1
-        if len(heap) < k:
-            heapq.heappush(heap, (count, seq, row))
-        elif count > heap[0][0]:
-            heapq.heapreplace(heap, (count, seq, row))
+        if favor_long_paths:
+            length_bonus = 1.0 + min(1.25, math.log1p(max(0, path_len - min_length)) * 0.18)
+            score = count * length_bonus
+            item = (score, count, seq, row)
+            if len(heap) < k:
+                heapq.heappush(heap, item)
+            elif score > heap[0][0]:
+                heapq.heapreplace(heap, item)
+        else:
+            if len(heap) < k:
+                heapq.heappush(heap, (count, seq, row))
+            elif count > heap[0][0]:
+                heapq.heapreplace(heap, (count, seq, row))
+    if favor_long_paths:
+        return [row for _, _, _, row in sorted(heap, key=lambda x: (x[0], x[1], x[2]), reverse=True)]
     return [row for _, _, row in sorted(heap, key=lambda x: (x[0], x[1]), reverse=True)]
+
+
+def _densify_coords(coords, points_per_segment=6):
+    if len(coords) < 2:
+        return coords
+    out = [coords[0]]
+    for i in range(len(coords) - 1):
+        x0, y0 = coords[i]
+        x1, y1 = coords[i + 1]
+        for t in range(1, points_per_segment + 1):
+            a = t / (points_per_segment + 1)
+            out.append([x0 + (x1 - x0) * a, y0 + (y1 - y0) * a])
+        out.append(coords[i + 1])
+    return out
+
+
+def _smooth_coords(coords, alpha=0.22, rounds=2):
+    if len(coords) < 3:
+        return coords
+    pts = [list(p) for p in coords]
+    for _ in range(rounds):
+        new_pts = [pts[0]]
+        for i in range(1, len(pts) - 1):
+            px, py = pts[i - 1]
+            cx, cy = pts[i]
+            nx, ny = pts[i + 1]
+            sx = cx * (1 - alpha) + ((px + nx) / 2.0) * alpha
+            sy = cy * (1 - alpha) + ((py + ny) / 2.0) * alpha
+            new_pts.append([sx, sy])
+        new_pts.append(pts[-1])
+        pts = new_pts
+    return pts
+
+
+F7_DISPLAY_COORD_CAP = 120
+
+
+def _subsample_coords(coords, max_points):
+    if len(coords) <= max_points:
+        return coords
+    if max_points < 2:
+        return coords[:1]
+    step = max(1, (len(coords) - 1) // (max_points - 1))
+    picked = [coords[i] for i in range(0, len(coords), step)]
+    if picked[-1] is not coords[-1]:
+        picked.append(coords[-1])
+    return picked[:max_points]
+
+
+def _trajectory_like_coords(coords):
+    if len(coords) < 2:
+        return coords
+    coords = _subsample_coords(coords, F7_DISPLAY_COORD_CAP)
+    dense = _densify_coords(coords, points_per_segment=6)
+    if len(dense) > F7_DISPLAY_COORD_CAP * 3:
+        dense = _subsample_coords(dense, F7_DISPLAY_COORD_CAP * 3)
+    return _smooth_coords(dense, alpha=0.24, rounds=2)
 
 
 def _enrich_paths_with_gps_display(
@@ -1133,7 +1278,7 @@ def _enrich_paths_with_gps_display(
     rect1_bounds=None,
     rect2_bounds=None,
 ):
-    """仅对最终路径解析 GPS 展示坐标"""
+    """仅对最终路径解析 GPS 展示坐标；网格折线做轨迹化后处理"""
     exemplar_before = len(exemplar_store) if exemplar_store is not None else 0
     exemplar_dirty = False
     gps_hits = 0
@@ -1147,6 +1292,8 @@ def _enrich_paths_with_gps_display(
             rect1_bounds=rect1_bounds,
             rect2_bounds=rect2_bounds,
         )
+        if not from_gps:
+            display_coords = _trajectory_like_coords(display_coords)
         item['display_coords'] = display_coords
         item['display_from_gps'] = from_gps
         if from_gps:
@@ -1158,8 +1305,13 @@ def _enrich_paths_with_gps_display(
 
 def _get_global_frequent_candidates(k, min_distance, min_length=2):
     _opt_stats['f7_queries'] += 1
+    favor_long_paths = min_distance <= 0
     return _select_frequent_paths_by_distance(
-        path_trie.get_all_paths_iter(), k, min_distance, min_length
+        path_trie.get_all_paths_iter(),
+        k,
+        min_distance,
+        min_length,
+        favor_long_paths=favor_long_paths,
     )
 
 
@@ -1374,11 +1526,129 @@ def generate_paths_with_regions_map_payload(paths_data, rect1_bounds, rect2_boun
     return build_payload(vs, layers, '车辆ID: {taxi_id}', lock_viewport=True)
 
 
-def _od_paths_to_arcs(od_paths, mode='f5'):
+def _f6_is_edge_region(rect_bounds):
+    x_min, y_min, x_max, y_max = rect_bounds
+    bx0, by0, bx1, by1 = BOUNDS
+    mx = (bx1 - bx0) * F6_BALANCE_EDGE_MARGIN_RATIO
+    my = (by1 - by0) * F6_BALANCE_EDGE_MARGIN_RATIO
+    return (
+        x_min <= bx0 + mx or x_max >= bx1 - mx
+        or y_min <= by0 + my or y_max >= by1 - my
+    )
+
+
+def _f6_direction_sector_from_path(p):
+    sx, sy = p['source'][0], p['source'][1]
+    tx, ty = p['target'][0], p['target'][1]
+    dx = tx - sx
+    dy = ty - sy
+    angle = math.atan2(dy, dx)
+    sector = int(((angle + math.pi) / (2 * math.pi)) * 8) % 8
+    quadrant = int(((angle + math.pi) / (2 * math.pi)) * 4) % 4
+    return sector, quadrant
+
+
+def _f6_balance_metrics(od_paths):
+    if not od_paths:
+        return {'imbalance': 0.0, 'dominant_ratio': 0.0, 'sector_counts': [0] * 8}
+    sector_counts = [0] * 8
+    weighted_total = 0
+    for p in od_paths:
+        s, _ = _f6_direction_sector_from_path(p)
+        w = max(1, int(p.get('count', 1)))
+        sector_counts[s] += w
+        weighted_total += w
+    if weighted_total <= 0:
+        return {'imbalance': 0.0, 'dominant_ratio': 0.0, 'sector_counts': sector_counts}
+    dominant = max(sector_counts)
+    dominant_ratio = dominant / weighted_total
+    even_ratio = 1.0 / 8.0
+    imbalance = max(0.0, (dominant_ratio - even_ratio) / (1.0 - even_ratio))
+    return {
+        'imbalance': float(imbalance),
+        'dominant_ratio': float(dominant_ratio),
+        'sector_counts': sector_counts,
+    }
+
+
+def _f6_quota_sample_paths(od_paths, cap=OD_MAX_ARCS):
+    if len(od_paths) <= cap:
+        return od_paths
+
+    buckets = {i: [] for i in range(8)}
+    bucket_flow = {i: 0 for i in range(8)}
+    for p in od_paths:
+        s, _ = _f6_direction_sector_from_path(p)
+        buckets[s].append(p)
+        bucket_flow[s] += max(1, int(p.get('count', 1)))
+
+    for i in range(8):
+        buckets[i].sort(key=lambda x: x.get('count', 0), reverse=True)
+
+    non_empty = [i for i in range(8) if buckets[i]]
+    if not non_empty:
+        return od_paths[:cap]
+
+    min_keep = 1
+    picked = []
+    picked_ids = set()
+    for i in non_empty:
+        for p in buckets[i][:min_keep]:
+            pid = (p.get('start_grid'), p.get('end_grid'), p.get('period'), p.get('direction'))
+            if pid not in picked_ids:
+                picked.append(p)
+                picked_ids.add(pid)
+
+    remain = max(0, cap - len(picked))
+    if remain <= 0:
+        return picked[:cap]
+
+    total_flow = sum(bucket_flow[i] for i in non_empty)
+    alloc = {i: 0 for i in non_empty}
+    if total_flow > 0:
+        raw_alloc = {i: remain * (bucket_flow[i] / total_flow) for i in non_empty}
+        for i in non_empty:
+            alloc[i] = int(raw_alloc[i])
+        left = remain - sum(alloc.values())
+        if left > 0:
+            order = sorted(non_empty, key=lambda i: (raw_alloc[i] - alloc[i]), reverse=True)
+            for i in order[:left]:
+                alloc[i] += 1
+
+    for i in non_empty:
+        needed = alloc[i]
+        if needed <= 0:
+            continue
+        for p in buckets[i][min_keep:min_keep + needed]:
+            pid = (p.get('start_grid'), p.get('end_grid'), p.get('period'), p.get('direction'))
+            if pid not in picked_ids:
+                picked.append(p)
+                picked_ids.add(pid)
+
+    if len(picked) < cap:
+        rest = []
+        for i in non_empty:
+            rest.extend(buckets[i][min_keep + alloc[i]:])
+        rest.sort(key=lambda x: x.get('count', 0), reverse=True)
+        for p in rest:
+            if len(picked) >= cap:
+                break
+            pid = (p.get('start_grid'), p.get('end_grid'), p.get('period'), p.get('direction'))
+            if pid not in picked_ids:
+                picked.append(p)
+                picked_ids.add(pid)
+
+    return picked[:cap]
+
+
+def _od_paths_to_arcs(od_paths, mode='f5', balance_mode=False):
     """每条网格 OD 路径对应一条拱形弧线。mode: f5 | f6"""
     total = len(od_paths)
     if total > OD_MAX_ARCS:
-        od_paths = od_paths[:OD_MAX_ARCS]
+        if mode == 'f6' and balance_mode:
+            od_paths = _f6_quota_sample_paths(od_paths, OD_MAX_ARCS)
+        else:
+            od_paths = od_paths[:OD_MAX_ARCS]
 
     period_base_height = {'早高峰': 0.22, '晚高峰': 0.32, '平峰': 0.42}
     if mode == 'f6':
@@ -1409,8 +1679,18 @@ def _od_paths_to_arcs(od_paths, mode='f5'):
     arcs = []
     for p in od_paths:
         pname = p['period']
+        sector, quadrant = _f6_direction_sector_from_path(p)
         jitter = ((p['start_grid'] * 13 + p['end_grid'] * 7) % 15) * 0.015
-        height = period_base_height.get(pname, 0.3) + jitter
+
+        base_h = period_base_height.get(pname, 0.3)
+        if mode == 'f6' and balance_mode:
+            sector_height = (sector - 3.5) * 0.06
+            quadrant_height = (quadrant - 1.5) * 0.09
+            direction_boost = 0.10 if p['direction'] == dir_primary else 0.03
+            height = max(0.10, base_h + sector_height + quadrant_height + direction_boost + jitter)
+        else:
+            height = base_h + jitter
+
         if p['direction'] == dir_primary:
             color = color_primary.get(pname, [80, 255, 120, 200])
         else:
@@ -1475,7 +1755,20 @@ def generate_f6_map_payload(rect_bounds, period_param='all'):
 
     period = _period_from_param(period_param)
     od_paths = get_od_paths_for_region(rect_bounds, period)
-    arcs, total_paths = _od_paths_to_arcs(od_paths, mode='f6')
+
+    edge_region = _f6_is_edge_region(rect_bounds)
+    balance_metrics = _f6_balance_metrics(od_paths)
+    imbalance = balance_metrics['imbalance']
+    auto_balance_mode = (
+        len(od_paths) >= F6_BALANCE_MIN_TOTAL_PATHS
+        and (edge_region or imbalance >= F6_BALANCE_DIRECTION_IMBALANCE_THRESHOLD)
+    )
+
+    arcs, total_paths = _od_paths_to_arcs(
+        od_paths,
+        mode='f6',
+        balance_mode=auto_balance_mode,
+    )
 
     layers = [polygon_layer(polygons)]
     if arcs:
@@ -1486,6 +1779,13 @@ def generate_f6_map_payload(rect_bounds, period_param='all'):
         'arc_count': len(arcs),
         'total_paths': total_paths,
         'capped': total_paths > OD_MAX_ARCS,
+        'balance_mode': auto_balance_mode,
+        'edge_region': edge_region,
+        'flow_imbalance': imbalance,
+        'boundary_hint': (
+            '区域贴近研究边界，已自动优化飞线展示均衡性'
+            if edge_region else None
+        ),
     }
     return build_payload(
         vs, layers, '{label}: {count} 次', meta=meta, lock_viewport=True
@@ -1514,13 +1814,14 @@ def generate_region_highlight_payload(rect1_bounds, rect2_bounds=None, highlight
     return build_payload(vs, layers, '', lock_viewport=True)
 
 
-def generate_f4_density_map_payload(heatmap_period=None):
-    """F4 专用：平面 2D 热力图（非立体柱）"""
+def generate_f4_density_map_payload(heatmap_period=None, expand_ratio=F4_DEFAULT_EXPAND_RATIO):
+    """F4 专用：平面 2D 热力图 + 立体柱"""
+    ratio = _normalize_f4_expand_ratio(expand_ratio)
     if heatmap_period is None:
-        grid_data, max_count, total_points = get_all_day_density()
+        grid_data, max_count, total_points = get_all_day_density(ratio)
         period_name = '全天'
     else:
-        grid_data, max_count, total_points = get_density_data_by_period(heatmap_period)
+        grid_data, max_count, total_points = get_density_data_by_period(heatmap_period, ratio)
         period_name = TimePeriod.get_period_name(heatmap_period)
 
     for item in grid_data:
@@ -1549,20 +1850,47 @@ def generate_f4_density_map_payload(heatmap_period=None):
             'period_name': period_name,
             'total_points': total_points,
             'layers': 'heatmap+column',
+            'expand_ratio': ratio,
+            'expand_ratio_options': F4_EXPAND_RATIOS,
         },
         lock_viewport=True,
     )
 
 
+def _search_rect_polygon(rect):
+    """F3 探查区域：浅绿填充 + 绿色描边"""
+    x_min = float(rect['x_min'])
+    y_min = float(rect['y_min'])
+    x_max = float(rect['x_max'])
+    y_max = float(rect['y_max'])
+    return {
+        'polygon': [
+            [x_min, y_min], [x_max, y_min], [x_max, y_max], [x_min, y_max],
+        ],
+        'fill_color': [0, 200, 0, 20],
+        'line_color': [0, 255, 0, 255],
+    }, (x_min, y_min, x_max, y_max)
+
+
 def generate_map_payload(points_data=None, show_heatmap=False, path_coords=None,
                        start_lon=None, start_lat=None, end_lon=None, end_lat=None,
-                       heatmap_period=None):
+                       heatmap_period=None, search_rect=None):
     layers = []
     tooltip_text = ''
     vs = dict(DEFAULT_VIEW_STATE)
+    all_lons, all_lats = [], []
 
     if show_heatmap:
         return generate_f4_density_map_payload(heatmap_period)
+
+    if search_rect and all(k in search_rect for k in ('x_min', 'y_min', 'x_max', 'y_max')):
+        poly, bounds = _search_rect_polygon(search_rect)
+        layers.append(polygon_layer(
+            [poly], layer_id='f3-search-region', line_width_min_pixels=3,
+        ))
+        x_min, y_min, x_max, y_max = bounds
+        all_lons.extend([x_min, x_max])
+        all_lats.extend([y_min, y_max])
 
     if path_coords and len(path_coords) > 0:
         layers.append(path_layer([{'path': path_coords, 'color': [255, 100, 50, 255], 'width': 5}]))
@@ -1583,7 +1911,15 @@ def generate_map_payload(points_data=None, show_heatmap=False, path_coords=None,
             points_data, layer_id='search-highlight',
             radius=50, color=[230, 80, 50, 200], opacity=0.9
         ))
+        for p in points_data:
+            all_lons.append(p['lon'])
+            all_lats.append(p['lat'])
         tooltip_text = '车辆ID: {taxi_id}'
+
+    if all_lons and all_lats:
+        vs = view_state_for_coords(all_lons, all_lats)
+    elif search_rect:
+        vs = view_state_for_coords(all_lons, all_lats)
 
     return build_payload(vs, layers, tooltip_text, lock_viewport=True)
 
@@ -1691,48 +2027,62 @@ def region_search():
         points = points[:MAX_SEARCH_RESULTS]
     result = [{'lon': p[0], 'lat': p[1], 'taxi_id': p[2], 'timestamp': str(p[3])} for p in points]
     print(f"🔍 搜索: 找到={total}, 返回={len(result)}, 耗时={time.time()-start:.3f}s")
-    return jsonify({'count': total, 'returned': len(result), 'query_time': time.time()-start,
-                    'map': generate_map_payload(points_data=result)})
+    return jsonify({
+        'count': total,
+        'returned': len(result),
+        'query_time': time.time() - start,
+        'map': generate_map_payload(points_data=result, search_rect=rect),
+    })
 
 
 @app.route('/api/density_view', methods=['GET'])
 def density_view():
-    return jsonify({'map': generate_f4_density_map_payload(heatmap_period=None)})
+    expand_ratio = _normalize_f4_expand_ratio(request.args.get('expand_ratio', F4_DEFAULT_EXPAND_RATIO))
+    return jsonify({'map': generate_f4_density_map_payload(heatmap_period=None, expand_ratio=expand_ratio)})
 
 
 @app.route('/api/density_by_period', methods=['POST'])
 def density_by_period():
-    data = request.json
+    data = request.json or {}
     period = data.get('period')
+    expand_ratio = _normalize_f4_expand_ratio(data.get('expand_ratio', F4_DEFAULT_EXPAND_RATIO))
     if period == 'all' or period is None:
         period = None
     else:
         period = int(period)
 
     if period is None:
-        _, _, total_points = get_all_day_density()
+        _, _, total_points = get_all_day_density(expand_ratio)
         period_name = "全天"
     else:
-        _, _, total_points = get_density_data_by_period(period)
+        _, _, total_points = get_density_data_by_period(period, expand_ratio)
         period_name = TimePeriod.get_period_name(period)
 
     return jsonify({
         'period': period,
         'period_name': period_name,
         'total_points': total_points,
-        'map': generate_f4_density_map_payload(heatmap_period=period),
+        'expand_ratio': expand_ratio,
+        'expand_ratio_options': F4_EXPAND_RATIOS,
+        'map': generate_f4_density_map_payload(heatmap_period=period, expand_ratio=expand_ratio),
     })
 
 
 @app.route('/api/density_stats', methods=['GET'])
 def density_stats():
+    expand_ratio = _normalize_f4_expand_ratio(
+        request.args.get('expand_ratio', F4_DEFAULT_EXPAND_RATIO)
+    )
     stats = []
-    _, _, total_points = get_all_day_density()
+    _, _, total_points = get_all_day_density(expand_ratio)
     stats.append({'name': '全天', 'total_points': total_points})
     for period in TimePeriod.get_all_periods():
-        _, _, total_points = get_density_data_by_period(period)
+        _, _, total_points = get_density_data_by_period(period, expand_ratio)
         stats.append({'name': TimePeriod.get_period_name(period), 'total_points': total_points})
-    return jsonify(stats)
+    return jsonify({
+        'expand_ratio': expand_ratio,
+        'stats': stats,
+    })
 
 
 @app.route('/api/normal_view', methods=['GET'])
@@ -1902,11 +2252,12 @@ def od_region_flow():
 @app.route('/api/frequent_paths_global', methods=['POST'])
 def frequent_paths_global():
     """F7: 全局 Top-k（网格统计 + GPS 样例展示）"""
-    data = request.json
+    data = request.json or {}
     k = data.get('k', 10)
     min_distance = data.get('min_distance', 0)
 
-    staged = _get_global_frequent_candidates(k, min_distance, min_length=2)
+    min_length = data.get('min_length', 2)
+    staged = _get_global_frequent_candidates(k, min_distance, min_length=min_length)
     result_paths, gps_hits = _enrich_paths_with_gps_display(staged, path_exemplars)
     paths_for_map = [(p['display_coords'], p['count'], None) for p in result_paths]
 

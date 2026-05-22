@@ -151,8 +151,11 @@ def heatmap_layer(grid_data, layer_id='density-heatmap', radius_pixels=50):
     }
 
 
-def polygon_layer(polygons):
-    return {'type': 'polygon', 'id': 'regions', 'data': polygons}
+def polygon_layer(polygons, layer_id='regions', line_width_min_pixels=None):
+    spec = {'type': 'polygon', 'id': layer_id, 'data': polygons}
+    if line_width_min_pixels is not None:
+        spec['line_width_min_pixels'] = line_width_min_pixels
+    return spec
 
 
 def arc_layer(arcs, layer_id='od-arcs'):
@@ -161,23 +164,56 @@ def arc_layer(arcs, layer_id='od-arcs'):
 
 
 def trajectory_paths_to_layers(trajectory_paths):
+    """
+    F1 默认效果：GPS 黄点 + 橙红折线（单车更粗；多车统一橙线便于叠加观看）
+    """
     paths = []
+    scatter_points = []
+    is_single = len(trajectory_paths) == 1
+    point_color = [255, 210, 0, 230]
+
     for i, item in enumerate(trajectory_paths):
+        path = item['path']
+        if is_single:
+            line_color = [255, 69, 0, 255]
+            width = 4
+        else:
+            line_color = [255, 100, 50, 235]
+            width = 2
+
         paths.append({
-            'path': item['path'],
+            'path': path,
             'taxi_id': item['taxi_id'],
-            'color': TRAJECTORY_COLORS[i % len(TRAJECTORY_COLORS)],
-            'width': 3,
+            'color': line_color,
+            'width': width,
         })
+        for lon, lat in path:
+            scatter_points.append({
+                'lon': lon,
+                'lat': lat,
+                'taxi_id': item['taxi_id'],
+                'color': point_color,
+            })
+
+    # 先画折线、后画点：deck.gl 后添加的图层在上层，黄点盖在橙线之上
     layers = [path_layer(paths, 'trajectories')]
-    if len(trajectory_paths) == 1:
-        p = trajectory_paths[0]['path']
+    if scatter_points:
+        layers.append(scatter_layer(
+            scatter_points,
+            layer_id='trajectory-gps-points',
+            radius=20 if is_single else 16,
+            color=point_color,
+            opacity=0.92,
+        ))
+
+    if is_single and paths:
+        p = paths[0]['path']
         layers.append(scatter_layer(
             [
                 {'lon': p[0][0], 'lat': p[0][1], 'type': '起点', 'color': [50, 200, 50, 255]},
                 {'lon': p[-1][0], 'lat': p[-1][1], 'type': '终点', 'color': [200, 50, 50, 255]},
             ],
-            layer_id='markers',
+            layer_id='trajectory-endpoints',
             radius=80,
             color=[255, 255, 255, 255],
         ))

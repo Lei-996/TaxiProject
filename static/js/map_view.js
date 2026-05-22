@@ -108,7 +108,7 @@
                     stroked: true,
                     filled: true,
                     wireframe: false,
-                    lineWidthMinPixels: 2,
+                    lineWidthMinPixels: spec.line_width_min_pixels ?? 2,
                     getPolygon: (d) => d.polygon,
                     getFillColor: (d) => d.fill_color,
                     getLineColor: (d) => d.line_color,
