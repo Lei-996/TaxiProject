@@ -11,9 +11,9 @@ class TrieNode:
     """前缀树节点"""
     def __init__(self):
         self.children = {}
-        self.count = 0
+        self.count = 0  # 行程次数（保留用于调试）
+        self.vehicle_set = set()  # 新增：记录经过的车辆ID
         self.is_end = False
-        self.end_count = 0
 
 
 class PathTrie:
@@ -23,7 +23,14 @@ class PathTrie:
         self.root = TrieNode()
         self.total_paths = 0
     
-    def insert(self, path_sequence):
+    def insert(self, path_sequence, vehicle_id=None):
+        """
+        插入一条路径序列
+        
+        Args:
+            path_sequence: 网格ID列表
+            vehicle_id: 车辆ID（用于去重统计）
+        """
         if not path_sequence:
             return
         
@@ -33,10 +40,19 @@ class PathTrie:
                 node.children[grid_id] = TrieNode()
             node = node.children[grid_id]
             node.count += 1
+            if vehicle_id is not None:
+                node.vehicle_set.add(vehicle_id)
         
         node.is_end = True
-        node.end_count += 1
-        self.total_paths += 1
+    
+    def get_path_vehicle_count(self, path_sequence):
+        """获取路径的不同车辆数"""
+        node = self.root
+        for grid_id in path_sequence:
+            if grid_id not in node.children:
+                return 0
+            node = node.children[grid_id]
+        return len(node.vehicle_set)
     
     def search_prefix(self, prefix):
         node = self.root
@@ -62,12 +78,15 @@ class PathTrie:
         return results
     
     def get_all_paths_iter(self):
-        """流式遍历所有完整路径，避免一次性装入内存"""
+        """流式遍历所有完整路径，返回 (path, vehicle_count)"""
         stack = [(self.root, [])]
         while stack:
             node, current_path = stack.pop()
             if node.is_end:
-                yield current_path.copy(), node.end_count
+                # 返回车辆数而不是行程次数
+                vehicle_count = len(node.vehicle_set)
+                if vehicle_count > 0:
+                    yield current_path.copy(), vehicle_count
             for grid_id, child in node.children.items():
                 current_path.append(grid_id)
                 stack.append((child, current_path.copy()))
@@ -98,7 +117,8 @@ class PathTrie:
         max_candidates=None,
     ):
         """
-        DFS 剪枝：仅从起点区域网格向下搜索，到终点区域即收集，避免扫全 Trie。
+        DFS 剪枝：仅从起点区域网格向下搜索，到终点区域即收集
+        返回 (path, vehicle_count)
         """
         start_grids = set(start_grids)
         end_grids = set(end_grids)
@@ -112,7 +132,9 @@ class PathTrie:
                 return
             if node.is_end and len(path) >= min_length:
                 if path[0] in start_grids and path[-1] in end_grids:
-                    results.append((path.copy(), node.end_count))
+                    vehicle_count = len(node.vehicle_set)
+                    if vehicle_count > 0:
+                        results.append((path.copy(), vehicle_count))
             if len(path) >= max_depth:
                 return
             for grid_id, child in node.children.items():
@@ -174,7 +196,7 @@ class PathTrie:
         nodes.append({
             'count': self.root.count,
             'is_end': self.root.is_end,
-            'end_count': self.root.end_count
+            'vehicle_set': list(self.root.vehicle_set),  # set 转 list 以便序列化
         })
         
         while stack:
@@ -186,7 +208,7 @@ class PathTrie:
                     nodes.append({
                         'count': child.count,
                         'is_end': child.is_end,
-                        'end_count': child.end_count
+                        'vehicle_set': list(child.vehicle_set),
                     })
                     stack.append((child, child_id))
                 edges.append({
@@ -203,7 +225,6 @@ class PathTrie:
     
     @classmethod
     def load(cls, filepath):
-        """从缓存文件加载 Trie（扁平序列化格式，非递归 pickle 对象树）"""
         with open(filepath, 'rb') as f:
             data = pickle.load(f)
 
@@ -212,7 +233,7 @@ class PathTrie:
         for i, node_data in enumerate(data['nodes']):
             nodes[i].count = node_data['count']
             nodes[i].is_end = node_data['is_end']
-            nodes[i].end_count = node_data['end_count']
+            nodes[i].vehicle_set = set(node_data.get('vehicle_set', []))  # list 转 set
 
         for edge in data['edges']:
             nodes[edge['from']].children[edge['grid_id']] = nodes[edge['to']]
@@ -263,17 +284,57 @@ def trajectory_to_path_sequence(trip_points, min_grids=2):
 
 
 def trip_to_display_coords(trip_points, max_points=500):
-    """将行程 GPS 转为地图折线坐标（抽稀以控制点数）"""
+    """将行程 GPS 转为地图折线坐标，并过滤异常点"""
     if not trip_points:
         return []
-    coords = [[float(p['lon']), float(p['lat'])] for p in trip_points]
-    if len(coords) <= max_points:
-        return coords
-    step = max(1, len(coords) // max_points)
-    sampled = coords[::step]
-    if sampled[-1] != coords[-1]:
-        sampled.append(coords[-1])
-    return sampled[:max_points]
+    
+    from grid_utils import lonlat_to_grid_id
+    
+    # 定义北京地区的合理范围（稍大于 BOUNDS）
+    LON_MIN_VALID = 115.5
+    LON_MAX_VALID = 117.5
+    LAT_MIN_VALID = 39.0
+    LAT_MAX_VALID = 41.0
+    
+    # 过滤异常点
+    filtered_points = []
+    for p in trip_points:
+        lon, lat = p['lon'], p['lat']
+        if LON_MIN_VALID <= lon <= LON_MAX_VALID and LAT_MIN_VALID <= lat <= LAT_MAX_VALID:
+            filtered_points.append(p)
+    
+    if len(filtered_points) < 2:
+        # 如果过滤后点太少，返回原始首尾
+        return [
+            [float(trip_points[0]['lon']), float(trip_points[0]['lat'])],
+            [float(trip_points[-1]['lon']), float(trip_points[-1]['lat'])]
+        ]
+    
+    # 提取网格序列和每个网格的代表点
+    grid_seq = []
+    grid_points = []
+    
+    for p in filtered_points:
+        gid = lonlat_to_grid_id(p['lon'], p['lat'])
+        if gid != -1:
+            if not grid_seq or grid_seq[-1] != gid:
+                grid_seq.append(gid)
+                grid_points.append([float(p['lon']), float(p['lat'])])
+    
+    if len(grid_points) < 2:
+        return [
+            [float(filtered_points[0]['lon']), float(filtered_points[0]['lat'])],
+            [float(filtered_points[-1]['lon']), float(filtered_points[-1]['lat'])]
+        ]
+    
+    # 抽稀
+    if len(grid_points) > max_points:
+        step = max(1, len(grid_points) // max_points)
+        grid_points = grid_points[::step]
+        if grid_points[-1] != [float(filtered_points[-1]['lon']), float(filtered_points[-1]['lat'])]:
+            grid_points.append([float(filtered_points[-1]['lon']), float(filtered_points[-1]['lat'])])
+    
+    return grid_points
 
 
 def _path_key(path_seq):
@@ -442,7 +503,7 @@ def build_path_trie(
             trip_count += 1
             path_seq = trajectory_to_path_sequence(trip, min_grids=2)
             if len(path_seq) >= 2:
-                trie.insert(path_seq)
+                trie.insert(path_seq, vehicle_id=vid)  # 传入车辆ID
                 exemplar_store.register(path_seq, trip)
                 path_count += 1
 

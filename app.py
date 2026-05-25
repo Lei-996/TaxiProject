@@ -1282,10 +1282,12 @@ def _enrich_paths_with_gps_display(
     rect1_bounds=None,
     rect2_bounds=None,
 ):
-    """仅对最终路径解析 GPS 展示坐标；网格折线做轨迹化后处理"""
+    """仅对最终路径解析 GPS 展示坐标；并验证 GPS 起终点是否在区域内"""
     exemplar_before = len(exemplar_store) if exemplar_store is not None else 0
     exemplar_dirty = False
     gps_hits = 0
+    filtered_rows = []  # 过滤后的结果
+    
     for item in path_rows:
         display_coords, from_gps, dirty = _resolve_display_coords(
             item['grid_ids'],
@@ -1296,15 +1298,34 @@ def _enrich_paths_with_gps_display(
             rect1_bounds=rect1_bounds,
             rect2_bounds=rect2_bounds,
         )
+        
+        # 验证 GPS 起终点是否在用户框选的区域内
+        if from_gps and rect1_bounds and rect2_bounds and len(display_coords) >= 2:
+            start_lon, start_lat = display_coords[0]
+            end_lon, end_lat = display_coords[-1]
+            
+            x_min1, y_min1, x_max1, y_max1 = rect1_bounds
+            x_min2, y_min2, x_max2, y_max2 = rect2_bounds
+            
+            start_in_rect1 = (x_min1 <= start_lon <= x_max1 and y_min1 <= start_lat <= y_max1)
+            end_in_rect2 = (x_min2 <= end_lon <= x_max2 and y_min2 <= end_lat <= y_max2)
+            
+            if not start_in_rect1 or not end_in_rect2:
+                # GPS 起点或终点不在用户框选的区域内，跳过这条路径
+                continue
+        
         if not from_gps:
             display_coords = _trajectory_like_coords(display_coords)
+        
         item['display_coords'] = display_coords
         item['display_from_gps'] = from_gps
         if from_gps:
             gps_hits += 1
         exemplar_dirty = exemplar_dirty or dirty
+        filtered_rows.append(item)
+    
     _persist_exemplars_if_updated(exemplar_store, exemplar_before, exemplar_dirty)
-    return path_rows, gps_hits
+    return filtered_rows, gps_hits
 
 
 def _get_global_frequent_candidates(k, min_distance, min_length=2):
